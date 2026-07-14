@@ -1,9 +1,9 @@
 import os
 import asyncio
+import threading
 import tempfile
 import logging
 from flask import Flask, request
-from threading import Thread
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
@@ -11,13 +11,17 @@ import yt_dlp
 logging.basicConfig(level=logging.INFO)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
+PORT = int(os.environ.get("PORT", 8080))
+RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 app = Flask(__name__)
+bot_loop = asyncio.new_event_loop()
 
-@app.route("/")
-@app.route("/health")
-def health():
-    return "OK", 200
+application = (
+    Application.builder()
+    .token(TOKEN)
+    .build()
+)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -96,24 +100,37 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await processing_msg.delete()
 
-async def run_bot():
-    application = (
-        Application.builder()
-        .token(TOKEN)
-        .build()
-    )
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
+application.add_handler(CommandHandler("start", start))
+application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
-    logging.info("Bot iniciado en modo polling...")
-    await application.run_polling()
+async def initialize_bot():
+    await application.initialize()
+    await application.start()
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"https://{RENDER_EXTERNAL_URL}/webhook"
+        await application.bot.set_webhook(url=webhook_url)
+        logging.info(f"Webhook configurado en {webhook_url}")
+    else:
+        logging.warning("RENDER_EXTERNAL_HOSTNAME no está configurado; webhook no establecido.")
 
-def start_bot_in_thread():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(run_bot())
+def run_bot_loop():
+    asyncio.set_event_loop(bot_loop)
+    bot_loop.run_forever()
+
+threading.Thread(target=run_bot_loop, daemon=True).start()
+
+asyncio.run_coroutine_threadsafe(initialize_bot(), bot_loop)
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    asyncio.run_coroutine_threadsafe(application.process_update(update), bot_loop)
+    return "OK", 200
+
+@app.route("/")
+@app.route("/health")
+def health():
+    return "OK", 200
 
 if __name__ == "__main__":
-    Thread(target=start_bot_in_thread, daemon=True).start()
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=PORT)
