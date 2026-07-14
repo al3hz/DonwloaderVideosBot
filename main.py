@@ -15,7 +15,6 @@ PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 app = Flask(__name__)
-bot_loop = asyncio.new_event_loop()
 
 application = (
     Application.builder()
@@ -103,28 +102,41 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 application.add_handler(CommandHandler("start", start))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
-async def initialize_bot():
-    await application.initialize()
-    await application.start()
-    if RENDER_EXTERNAL_URL:
-        webhook_url = f"https://{RENDER_EXTERNAL_URL}/webhook"
-        await application.bot.set_webhook(url=webhook_url)
-        logging.info(f"Webhook configurado en {webhook_url}")
-    else:
-        logging.warning("RENDER_EXTERNAL_HOSTNAME no está configurado; webhook no establecido.")
+_bot_loop = None
+_bot_ready = False
+_bot_lock = threading.Lock()
 
-def run_bot_loop():
-    asyncio.set_event_loop(bot_loop)
-    bot_loop.run_forever()
+async def _init_bot():
+    global _bot_ready
+    try:
+        await application.initialize()
+        await application.start()
+        if RENDER_EXTERNAL_URL:
+            webhook_url = f"https://{RENDER_EXTERNAL_URL}/webhook"
+            await application.bot.set_webhook(url=webhook_url)
+            logging.info(f"Webhook configurado en {webhook_url}")
+        _bot_ready = True
+    except Exception as e:
+        logging.error(f"Error inicializando bot: {e}")
 
-threading.Thread(target=run_bot_loop, daemon=True).start()
-
-asyncio.run_coroutine_threadsafe(initialize_bot(), bot_loop)
+def ensure_bot():
+    global _bot_loop, _bot_ready
+    if _bot_ready:
+        return
+    with _bot_lock:
+        if _bot_ready:
+            return
+        _bot_loop = asyncio.new_event_loop()
+        t = threading.Thread(target=_bot_loop.run_forever, daemon=True)
+        t.start()
+        fut = asyncio.run_coroutine_threadsafe(_init_bot(), _bot_loop)
+        fut.result(timeout=30)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    ensure_bot()
     update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run_coroutine_threadsafe(application.process_update(update), bot_loop)
+    asyncio.run_coroutine_threadsafe(application.process_update(update), _bot_loop)
     return "OK", 200
 
 @app.route("/")
