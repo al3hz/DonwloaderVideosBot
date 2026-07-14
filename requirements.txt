@@ -1,0 +1,4 @@
+python-telegram-bot>=20.7
+yt-dlp>=2023.12.30
+flask>=3.0.0
+gunicorn>=21.2.0
