@@ -1,13 +1,15 @@
 import os
 import re
+import json
 import time
 import asyncio
 import threading
 import tempfile
 import logging
+import subprocess
 from flask import Flask, request
-from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
 import requests
 
@@ -16,7 +18,43 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+BLACKLIST_FILE = os.path.join(tempfile.gettempdir(), "blacklist.json")
+
+def load_blacklist():
+    if os.path.exists(BLACKLIST_FILE):
+        with open(BLACKLIST_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+def save_blacklist(domains):
+    with open(BLACKLIST_FILE, "w") as f:
+        json.dump(list(domains), f)
+
 app = Flask(__name__)
+
+async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bl = load_blacklist()
+    args = context.args
+    if not args:
+        if bl:
+            text = "🚫 Dominios en lista negra:\n" + "\n".join(f"• `{d}`" for d in sorted(bl))
+        else:
+            text = "✅ No hay dominios en la lista negra."
+        await update.message.reply_text(text, parse_mode="Markdown")
+        return
+    action = args[0].lower()
+    if action == "add" and len(args) >= 2:
+        domain = args[1].lower().strip()
+        bl.add(domain)
+        save_blacklist(bl)
+        await update.message.reply_text(f"✅ `{domain}` añadido a la lista negra.", parse_mode="Markdown")
+    elif action == "remove" and len(args) >= 2:
+        domain = args[1].lower().strip()
+        bl.discard(domain)
+        save_blacklist(bl)
+        await update.message.reply_text(f"✅ `{domain}` eliminado de la lista negra.", parse_mode="Markdown")
+    else:
+        await update.message.reply_text("Uso: /blacklist — ver lista\n/blacklist add <dominio>\n/blacklist remove <dominio>")
 
 application = (
     Application.builder()
@@ -31,20 +69,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• TikTok (sin marca de agua)\n"
         "• YouTube / YouTube Shorts\n"
         "• Twitter / X\n"
-        "• Instagram (Reels, fotos, videos, stories)\n"
+        "• Instagram (Reels)\n"
         "• Facebook\n"
         "• Y muchas más...\n\n"
         "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots)."
     )
     await update.message.reply_text(text)
 
-def get_ydl_opts():
-    return {
+class ProgressTracker:
+    def __init__(self, loop, message):
+        self.loop = loop
+        self.message = message
+        self.last_pct = -1
+
+    def hook(self, d):
+        if d["status"] == "downloading":
+            try:
+                raw = d.get("_percent_str", "").strip().replace("%", "")
+                pct = float(raw)
+                if pct - self.last_pct >= 5 or (pct == 100 and self.last_pct != 100):
+                    self.last_pct = pct
+                    asyncio.run_coroutine_threadsafe(
+                        self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
+                        self.loop,
+                    )
+            except Exception:
+                pass
+
+def get_ydl_opts(progress_hook=None):
+    opts = {
         "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
         "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
     }
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+    return opts
 
 def download_instagram_photo(url):
     headers = {
@@ -87,6 +148,71 @@ def download_instagram_photo(url):
 
     return filename, "Instagram Photo"
 
+def compress_video(input_path, output_path, target_size=48 * 1024 * 1024):
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", input_path],
+        capture_output=True, text=True, timeout=30
+    )
+    codec = probe.stdout.strip()
+    crf = 28 if codec == "h264" else 23
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", input_path,
+         "-c:v", "libx264", "-preset", "fast",
+         "-crf", str(crf),
+         "-c:a", "aac", "-b:a", "128k",
+         "-movflags", "+faststart",
+         output_path],
+        capture_output=True, timeout=300
+    )
+    if os.path.exists(output_path) and os.path.getsize(output_path) < target_size:
+        return output_path
+    return None
+
+async def compress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    key = f"compress:{query.message.message_id}"
+    info = context.user_data.pop(key, None)
+    if not info:
+        await query.edit_message_text("❌ Esta solicitud ya expiró.")
+        return
+    filename = info["filename"]
+    if data == "compress_no":
+        os.remove(filename)
+        await query.edit_message_text(
+            f"❌ El archivo pesa más de 50 MB.\n"
+            f"Telegram no permite enviar archivos tan grandes."
+        )
+        return
+    await query.edit_message_text("⏳ Comprimiendo video...")
+    base, ext = os.path.splitext(filename)
+    compressed = base + "_compressed" + ext
+    loop = asyncio.get_running_loop()
+    result = await loop.run_in_executor(None, compress_video, filename, compressed)
+    if not result:
+        os.remove(filename)
+        await query.edit_message_text("❌ No se pudo comprimir lo suficiente para los 50 MB.")
+        return
+    file_size = os.path.getsize(compressed)
+    if file_size > 50 * 1024 * 1024:
+        os.remove(filename)
+        os.remove(compressed)
+        await query.edit_message_text("❌ El video comprimido aún supera los 50 MB.")
+        return
+    os.remove(filename)
+    await query.edit_message_text("📤 Subiendo a Telegram...")
+    with open(compressed, "rb") as f:
+        await info["context"].bot.send_video(
+            chat_id=query.message.chat_id,
+            video=f,
+            caption=f"📥 Descargado por @{info['context'].bot.username}\n🔗 {info['url']}",
+            duration=info["duration"] if info["duration"] else None,
+            supports_streaming=True,
+        )
+    os.remove(compressed)
+
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
 
@@ -94,20 +220,27 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Envía un enlace válido.")
         return
 
+    blacklist = load_blacklist()
+    if any(domain in url.lower() for domain in blacklist):
+        await update.message.reply_text("🚫 Este dominio está en la lista negra y no puede descargarse.")
+        return
+
     processing_msg = await update.message.reply_text("⏳ Analizando enlace...")
 
     try:
         loop = asyncio.get_running_loop()
         is_instagram = "instagram.com" in url
+        tracker = ProgressTracker(loop, processing_msg)
 
         def download():
             if is_instagram:
                 try:
                     fname, ftitle = download_instagram_photo(url)
-                    return fname, ftitle, 0, False
+                    return fname, ftitle, 0, False, True
                 except Exception:
                     pass
-            with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+            opts = get_ydl_opts(tracker.hook)
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 title = info.get("title", "Video")
@@ -119,18 +252,36 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if f.startswith(os.path.basename(base)):
                             filename = os.path.join(tempfile.gettempdir(), f)
                             break
-                return filename, title, duration, is_video
+                return filename, title, duration, is_video, False
 
-        filename, title, duration, is_video = await loop.run_in_executor(None, download)
-
+        result = await loop.run_in_executor(None, download)
+        filename, title, duration, is_video, is_photo = result
         file_size = os.path.getsize(filename)
 
         if file_size > 50 * 1024 * 1024:
+            if is_photo:
+                await processing_msg.edit_text("❌ La imagen es demasiado grande (>50 MB) para Telegram.")
+                os.remove(filename)
+                return
+
             await processing_msg.edit_text(
-                "❌ El archivo pesa más de 50 MB.\n"
-                "Telegram no permite enviar archivos tan grandes a través de bots normales."
+                f"📦 El archivo pesa {file_size / 1024 / 1024:.1f} MB (límite 50 MB)."
             )
-            os.remove(filename)
+            keyboard = [[
+                InlineKeyboardButton("✅ Sí, comprimir", callback_data="compress_yes"),
+                InlineKeyboardButton("❌ No, cancelar", callback_data="compress_no"),
+            ]]
+            ask_msg = await update.message.reply_text(
+                "¿Deseas comprimir el video para que pese menos de 50 MB?",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            context.user_data[f"compress:{ask_msg.message_id}"] = {
+                "filename": filename,
+                "title": title,
+                "duration": duration,
+                "url": url,
+                "context": context,
+            }
             return
 
         await processing_msg.edit_text("📤 Subiendo a Telegram...")
@@ -161,6 +312,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.delete()
 
 application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("blacklist", blacklist_cmd))
+application.add_handler(CallbackQueryHandler(compress_callback, pattern="^compress_"))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
 _bot_loop = None
