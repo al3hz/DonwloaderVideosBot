@@ -387,7 +387,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await processing_msg.edit_text("📤 Subiendo a Telegram...")
                 caption_text = f"📥 Descargado por @{context.bot.username}\n🔗 {url}"
 
-                # Abrimos los archivos ordenadamente para armar el media group
                 opened_files = []
                 try:
                     for i, path in enumerate(img_paths[:10]):  # Límite máximo de 10 elementos por grupo
@@ -536,4 +535,8 @@ def webhook():
 @app.route("/health")
 def health():
     if not _bot_ready:
-        
+        return "Bot not ready", 503
+    return "OK", 200
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=PORT)
