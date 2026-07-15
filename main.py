@@ -432,9 +432,10 @@ def ensure_bot():
     with _bot_lock:
         if _bot_ready:
             return
-        _bot_loop = asyncio.new_event_loop()
-        t = threading.Thread(target=_bot_loop.run_forever, daemon=True)
-        t.start()
+        if _bot_loop is None:
+            _bot_loop = asyncio.new_event_loop()
+            t = threading.Thread(target=_bot_loop.run_forever, daemon=True)
+            t.start()
         fut = asyncio.run_coroutine_threadsafe(_init_bot(), _bot_loop)
         fut.result(timeout=30)
 
@@ -453,8 +454,10 @@ def health():
 def _init_bot_sync():
     global _bot_ready, _bot_loop
     _bot_loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(_bot_loop)
-    _bot_loop.run_until_complete(_init_bot())
+    t = threading.Thread(target=_bot_loop.run_forever, daemon=True)
+    t.start()
+    fut = asyncio.run_coroutine_threadsafe(_init_bot(), _bot_loop)
+    fut.result(timeout=30)
 
 if __name__ == "__main__":
     if RENDER_EXTERNAL_URL:
