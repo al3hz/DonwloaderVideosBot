@@ -410,7 +410,8 @@ application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download
 
 _bot_loop = None
 _bot_ready = False
-_bot_lock = threading.Lock()
+_bot_init_done = False
+_bot_init_lock = threading.Lock()
 
 async def _init_bot():
     global _bot_ready
@@ -419,29 +420,45 @@ async def _init_bot():
         await application.start()
         if RENDER_EXTERNAL_URL:
             webhook_url = f"https://{RENDER_EXTERNAL_URL}/webhook"
-            await application.bot.set_webhook(url=webhook_url)
-            logging.info(f"Webhook configurado en {webhook_url}")
+            try:
+                await application.bot.set_webhook(url=webhook_url)
+                logging.info(f"Webhook configurado en {webhook_url}")
+            except Exception as e:
+                logging.warning(f"No se pudo configurar webhook (se reintentará): {e}")
         _bot_ready = True
+        logging.info("Bot inicializado correctamente")
     except Exception as e:
         logging.error(f"Error inicializando bot: {e}")
 
-def ensure_bot():
-    global _bot_loop, _bot_ready
-    if _bot_ready:
-        return
-    with _bot_lock:
-        if _bot_ready:
+def _run_bot_loop():
+    global _bot_loop
+    _bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_bot_loop)
+    try:
+        _bot_loop.run_until_complete(_init_bot())
+        _bot_loop.run_forever()
+    except Exception as e:
+        logging.error(f"Error en el loop del bot: {e}")
+
+def start_bot():
+    global _bot_init_done
+    with _bot_init_lock:
+        if _bot_init_done:
             return
-        if _bot_loop is None:
-            _bot_loop = asyncio.new_event_loop()
-            t = threading.Thread(target=_bot_loop.run_forever, daemon=True)
-            t.start()
-        fut = asyncio.run_coroutine_threadsafe(_init_bot(), _bot_loop)
-        fut.result(timeout=30)
+        t = threading.Thread(target=_run_bot_loop, daemon=True)
+        t.start()
+        _bot_init_done = True
+        for _ in range(50):
+            if _bot_ready:
+                break
+            time.sleep(0.1)
+
+start_bot()
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    ensure_bot()
+    if not _bot_ready:
+        return "Bot not ready", 503
     update = Update.de_json(request.get_json(force=True), application.bot)
     asyncio.run_coroutine_threadsafe(application.process_update(update), _bot_loop)
     return "OK", 200
@@ -451,15 +468,5 @@ def webhook():
 def health():
     return "OK", 200
 
-def _init_bot_sync():
-    global _bot_ready, _bot_loop
-    _bot_loop = asyncio.new_event_loop()
-    t = threading.Thread(target=_bot_loop.run_forever, daemon=True)
-    t.start()
-    fut = asyncio.run_coroutine_threadsafe(_init_bot(), _bot_loop)
-    fut.result(timeout=30)
-
 if __name__ == "__main__":
-    if RENDER_EXTERNAL_URL:
-        _init_bot_sync()
     app.run(host="0.0.0.0", port=PORT)
