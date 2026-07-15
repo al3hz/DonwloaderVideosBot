@@ -165,71 +165,6 @@ def combine_image_audio(image_path, audio_path, output_path):
     )
     return output_path if os.path.exists(output_path) else None
 
-def compress_video(input_path, output_path, target_size=48 * 1024 * 1024):
-    probe = subprocess.run(
-        ["ffprobe", "-v", "error", "-select_streams", "v:0",
-         "-show_entries", "stream=codec_name", "-of", "default=noprint_wrappers=1:nokey=1", input_path],
-        capture_output=True, text=True, timeout=30
-    )
-    codec = probe.stdout.strip()
-    crf = 28 if codec == "h264" else 23
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", input_path,
-         "-c:v", "libx264", "-preset", "fast",
-         "-crf", str(crf),
-         "-c:a", "aac", "-b:a", "128k",
-         "-movflags", "+faststart",
-         output_path],
-        capture_output=True, timeout=300
-    )
-    if os.path.exists(output_path) and os.path.getsize(output_path) < target_size:
-        return output_path
-    return None
-
-async def compress_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-    key = f"compress:{query.message.message_id}"
-    info = context.user_data.pop(key, None)
-    if not info:
-        await query.edit_message_text("❌ Esta solicitud ya expiró.")
-        return
-    filename = info["filename"]
-    if data == "compress_no":
-        os.remove(filename)
-        await query.edit_message_text(
-            f"❌ El archivo pesa más de 50 MB.\n"
-            f"Telegram no permite enviar archivos tan grandes."
-        )
-        return
-    await query.edit_message_text("⏳ Comprimiendo video...")
-    base, ext = os.path.splitext(filename)
-    compressed = base + "_compressed" + ext
-    loop = asyncio.get_running_loop()
-    result = await loop.run_in_executor(None, compress_video, filename, compressed)
-    if not result:
-        os.remove(filename)
-        await query.edit_message_text("❌ No se pudo comprimir lo suficiente para los 50 MB.")
-        return
-    file_size = os.path.getsize(compressed)
-    if file_size > 50 * 1024 * 1024:
-        os.remove(filename)
-        os.remove(compressed)
-        await query.edit_message_text("❌ El video comprimido aún supera los 50 MB.")
-        return
-    os.remove(filename)
-    await query.edit_message_text("📤 Subiendo a Telegram...")
-    with open(compressed, "rb") as f:
-        await info["context"].bot.send_video(
-            chat_id=query.message.chat_id,
-            video=f,
-            caption=f"📥 Descargado por @{info['context'].bot.username}\n🔗 {info['url']}",
-            duration=info["duration"] if info["duration"] else None,
-            supports_streaming=True,
-        )
-    os.remove(compressed)
-
 async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -429,29 +364,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file_size = os.path.getsize(filename)
 
         if file_size > 50 * 1024 * 1024:
-            if is_photo:
-                await processing_msg.edit_text("❌ La imagen es demasiado grande (>50 MB) para Telegram.")
-                os.remove(filename)
-                return
-
+            os.remove(filename)
             await processing_msg.edit_text(
-                f"📦 El archivo pesa {file_size / 1024 / 1024:.1f} MB (límite 50 MB)."
+                "❌ El archivo pesa más de 50 MB.\n"
+                "Telegram no permite enviar archivos tan grandes a través de bots normales."
             )
-            keyboard = [[
-                InlineKeyboardButton("✅ Sí, comprimir", callback_data="compress_yes"),
-                InlineKeyboardButton("❌ No, cancelar", callback_data="compress_no"),
-            ]]
-            ask_msg = await update.message.reply_text(
-                "¿Deseas comprimir el video para que pese menos de 50 MB?",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-            )
-            context.user_data[f"compress:{ask_msg.message_id}"] = {
-                "filename": filename,
-                "title": title,
-                "duration": duration,
-                "url": url,
-                "context": context,
-            }
             return
 
         await processing_msg.edit_text("📤 Subiendo a Telegram...")
@@ -483,7 +400,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("blacklist", blacklist_cmd))
-application.add_handler(CallbackQueryHandler(compress_callback, pattern="^compress_"))
 application.add_handler(CallbackQueryHandler(tiktok_callback, pattern="^tiktok_"))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
