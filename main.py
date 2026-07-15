@@ -161,6 +161,26 @@ def download_instagram_photo(url):
 
     return filename, "Instagram Photo"
 
+def _tiktok_api_fallback(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    resp = requests.post("https://tikwm.com/api/", data={"url": url.split("?")[0]}, headers=headers, timeout=30)
+    data = resp.json()
+    if data.get("code") != 0:
+        return None
+    result = data.get("data", {})
+    images = result.get("images", [])
+    music_url = result.get("music_info", {}).get("play", "")
+    if not images:
+        return None
+    slideshow_formats = [{"url": img, "ext": "jpg"} for img in images]
+    audio_formats = []
+    if music_url:
+        audio_formats = [{"url": music_url, "ext": "mp3"}]
+    return (slideshow_formats, audio_formats, images)
+
 def combine_image_audio(image_path, audio_path, output_path):
     probe = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -185,7 +205,6 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Esta solicitud ya expiró.")
         return
     url = stored["url"]
-    info = stored["info"]
     loop = asyncio.get_running_loop()
 
     if query.data == "tiktok_image":
@@ -275,18 +294,35 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- TikTok slideshow detection ---
         if is_tiktok:
-            if "/photo/" in url:
-                url = url.replace("/photo/", "/video/")
-            def extract_info():
+            clean_url = url.split("?")[0]
+            if "/photo/" in clean_url:
+                clean_url = clean_url.replace("/photo/", "/video/")
+
+            def try_ydl():
                 with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-                    return ydl.extract_info(url, download=False)
+                    return ydl.extract_info(clean_url, download=False)
 
-            info = await loop.run_in_executor(_download_executor, extract_info)
-            formats = info.get("formats", [])
-            slideshow_formats = [f for f in formats if f.get("format_id", "").startswith("slideshow-")]
+            slideshow_data = None
+            try:
+                info = await loop.run_in_executor(_download_executor, try_ydl)
+                formats = info.get("formats", [])
+                slideshow_formats = [f for f in formats if f.get("format_id", "").startswith("slideshow-")]
+                if slideshow_formats:
+                    audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"]
+                    slideshow_data = (slideshow_formats, audio_formats, None)
+            except Exception:
+                pass
 
-            if slideshow_formats:
-                audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"]
+            if not slideshow_data:
+                try:
+                    api_data = await loop.run_in_executor(_download_executor, _tiktok_api_fallback, url)
+                    if api_data:
+                        slideshow_data = api_data
+                except Exception:
+                    pass
+
+            if slideshow_data:
+                slideshow_formats, audio_formats, api_images = slideshow_data
 
                 if len(slideshow_formats) == 1 and audio_formats:
                     await processing_msg.edit_text("🖼️ TikTok: foto con audio.")
@@ -300,7 +336,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
                     context.user_data[f"tiktok:{ask_msg.message_id}"] = {
                         "url": url,
-                        "info": info,
                         "slideshow_format": slideshow_formats[0],
                         "audio_format": audio_formats[0],
                         "context": context,
@@ -311,14 +346,14 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 def dl_slideshow():
                     paths = []
-                    for sf in slideshow_formats:
-                        img_url = sf.get("url")
+                    targets = api_images if api_images else [sf.get("url") for sf in slideshow_formats]
+                    for i, img_url in enumerate(targets):
                         if not img_url:
                             continue
-                        ext = sf.get("ext", "jpg")
+                        ext = "jpg"
                         path = os.path.join(
                             tempfile.gettempdir(),
-                            f"tiktok_slide_{int(time.time())}_{sf['format_id']}.{ext}",
+                            f"tiktok_slide_{int(time.time())}_{i}.{ext}",
                         )
                         r = requests.get(img_url, timeout=60)
                         r.raise_for_status()
