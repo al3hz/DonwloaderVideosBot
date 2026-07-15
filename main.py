@@ -8,21 +8,65 @@ import tempfile
 import logging
 import subprocess
 import concurrent.futures
+from contextlib import contextmanager
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
-import requests 
+import requests
 
 from dotenv import load_dotenv
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
 
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 BLACKLIST_FILE = os.path.join(tempfile.gettempdir(), "blacklist.json")
+
+# --- Configuración robusta de yt-dlp ---
+YTDLP_COMMON_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "no_check_certificates": True,
+    "retries": 10,
+    "fragment_retries": 10,
+    "file_access_retries": 3,
+    "extractor_retries": 3,
+    "socket_timeout": 30,
+    "throttled_rate": "100K",
+    "merge_output_format": "mp4",
+    "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
+    "http_headers": {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    },
+    # Cookies: si tienes un cookies.txt en el proyecto, úsalo
+    # "cookies": "cookies.txt" if os.path.exists("cookies.txt") else None,
+}
+
+# Formato robusto: NO usar filesize porque YouTube no lo reporta para DASH
+# Primero intenta H.264 (compatible), luego cualquier best
+YTDLP_FORMAT = (
+    "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]/"
+    "bestvideo[height<=1080]+bestaudio/"
+    "best[height<=1080]/"
+    "best"
+)
 
 def load_blacklist():
     if os.path.exists(BLACKLIST_FILE):
@@ -35,8 +79,178 @@ def save_blacklist(domains):
         json.dump(list(domains), f)
 
 app = Flask(__name__)
-
 _download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="download")
+
+# --- Context manager para limpieza de archivos ---
+@contextmanager
+def temp_file_cleanup():
+    paths = []
+    try:
+        yield paths
+    finally:
+        for p in paths:
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception as e:
+                logging.warning(f"No se pudo eliminar {p}: {e}")
+
+# --- Progress tracker con throttling anti-rate-limit ---
+class ProgressTracker:
+    def __init__(self, loop, message):
+        self.loop = loop
+        self.message = message
+        self.last_pct = -1
+        self.last_update = 0
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def hook(self, d):
+        if d["status"] != "downloading":
+            return
+        try:
+            raw = d.get("_percent_str", "").strip().replace("%", "")
+            pct = float(raw)
+        except Exception:
+            return
+
+        with self._lock:
+            now = time.time()
+            # Mínimo 3 segundos entre edits para evitar rate limit de Telegram
+            if pct - self.last_pct < 10 and now - self.last_update < 3 and pct != 100:
+                return
+            if self._closed or not self.loop or self.loop.is_closed():
+                return
+            self.last_pct = pct
+            self.last_update = now
+
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
+                self.loop,
+            )
+        except Exception:
+            pass
+
+    def close(self):
+        self._closed = True
+
+def get_ydl_opts(progress_hook=None, extra_opts=None):
+    opts = {**YTDLP_COMMON_OPTS, "format": YTDLP_FORMAT}
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+    if extra_opts:
+        opts.update(extra_opts)
+    return opts
+
+# --- Descarga con fallback de formatos ---
+def download_with_fallback(url, progress_hook=None):
+    """
+    Intenta descargar con formato H.264, si falla prueba formatos más permisivos.
+    """
+    attempts = [
+        # Intento 1: H.264 1080p + AAC (máxima compatibilidad)
+        {
+            "format": "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]/best[height<=1080]/best",
+            "merge_output_format": "mp4",
+        },
+        # Intento 2: Cualquier video 1080p
+        {
+            "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+            "merge_output_format": "mp4",
+        },
+        # Intento 3: Cualquier cosa que funcione
+        {
+            "format": "best/bestvideo+bestaudio",
+            "merge_output_format": "mp4",
+        },
+        # Intento 4: Forzar extractor genérico (útil para Reddit con URLs directas)
+        {
+            "format": "best",
+            "force_generic_extractor": True,
+        },
+    ]
+
+    last_error = None
+    for i, attempt_opts in enumerate(attempts, 1):
+        try:
+            opts = get_ydl_opts(progress_hook, attempt_opts)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                filename = ydl.prepare_filename(info)
+                title = info.get("title", "Video")
+                duration = info.get("duration", 0)
+                is_video = bool(info.get("duration")) or info.get("is_video", True)
+
+                # yt-dlp a veces cambia la extensión tras merge
+                if not os.path.exists(filename):
+                    base = os.path.splitext(filename)[0]
+                    for f in os.listdir(tempfile.gettempdir()):
+                        if f.startswith(os.path.basename(base)):
+                            candidate = os.path.join(tempfile.gettempdir(), f)
+                            if os.path.getsize(candidate) > 1024:  # > 1KB = válido
+                                filename = candidate
+                                break
+
+                if not os.path.exists(filename) or os.path.getsize(filename) < 1024:
+                    raise yt_dlp.utils.DownloadError("Archivo descargado vacío o inexistente")
+
+                return filename, title, duration, is_video, None
+
+        except Exception as e:
+            last_error = e
+            logging.warning(f"Intento {i} falló para {url}: {e}")
+            continue
+
+    raise last_error
+
+# --- TikTok API fallback (sin cambios mayores) ---
+def _tiktok_api_fallback(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        resp = requests.post(
+            "https://tikwm.com/api/",
+            data={"url": url.split("?")[0]},
+            headers=headers,
+            timeout=30
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            return None
+        result = data.get("data", {})
+        images = result.get("images", [])
+        music_url = result.get("music_info", {}).get("play", "")
+        if not images:
+            return None
+        slideshow_formats = [{"url": img, "ext": "jpg"} for img in images]
+        audio_formats = []
+        if music_url:
+            audio_formats = [{"url": music_url, "ext": "mp3"}]
+        return (slideshow_formats, audio_formats, images)
+    except Exception as e:
+        logging.warning(f"TikTok API fallback falló: {e}")
+        return None
+
+# --- Handlers del bot ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "👋 ¡Hola! Soy tu bot de descargas.\n\n"
+        "📎 Envíame un enlace de:\n"
+        "• TikTok (sin marca de agua)\n"
+        "• YouTube / YouTube Shorts\n"
+        "• Twitter / X\n"
+        "• Instagram (Reels / Fotos)\n"
+        "• Facebook\n"
+        "• Reddit\n"
+        "• Y muchas más...\n\n"
+        "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots).\n\n"
+        "📋 Comandos:\n"
+        "  /blacklist — Ver /blacklist add <dominio> /blacklist remove <dominio>"
+    )
+    await update.message.reply_text(text)
 
 async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bl = load_blacklist()
@@ -60,128 +274,9 @@ async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_blacklist(bl)
         await update.message.reply_text(f"✅ `{domain}` eliminado de la lista negra.", parse_mode="Markdown")
     else:
-        await update.message.reply_text("Uso: /blacklist — ver lista\n/blacklist add <dominio>\n/blacklist remove <dominio>")
-
-application = (
-    Application.builder()
-    .token(TOKEN)
-    .build()
-)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 ¡Hola! Soy tu bot de descargas.\n\n"
-        "📎 Envíame un enlace de:\n"
-        "• TikTok (sin marca de agua)\n"
-        "• YouTube / YouTube Shorts\n"
-        "• Twitter / X\n"
-        "• Instagram (Reels)\n"
-        "• Facebook\n"
-        "• Y muchas más...\n\n"
-        "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots).\n\n"
-        "📋 Comandos:\n"
-        "  /blacklist — Ver /blacklist add <dominio> /blacklist remove <dominio>"
-    )
-    await update.message.reply_text(text)
-
-class ProgressTracker:
-    def __init__(self, loop, message):
-        self.loop = loop
-        self.message = message
-        self.last_pct = -1
-        self._closed = False
-
-    def hook(self, d):
-        if d["status"] == "downloading":
-            try:
-                raw = d.get("_percent_str", "").strip().replace("%", "")
-                pct = float(raw)
-                if pct - self.last_pct >= 5 or (pct == 100 and self.last_pct != 100):
-                    self.last_pct = pct
-                    if not self._closed and self.loop and not self.loop.is_closed():
-                        asyncio.run_coroutine_threadsafe(
-                            self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
-                            self.loop,
-                        )
-            except Exception:
-                pass
-
-    def close(self):
-        self._closed = True
-
-def get_ydl_opts(progress_hook=None):
-    opts = {
-        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
-        "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
-        "quiet": True,
-        "no_warnings": True,
-    }
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
-    return opts
-
-def download_instagram_photo(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
-    resp = requests.get(url, headers=headers, timeout=30)
-    html = resp.text
-
-    image_url = None
-    og = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
-    if og:
-        image_url = og.group(1)
-
-    if not image_url:
-        og = re.search(r'<meta\s+name="twitter:image"\s+content="([^"]+)"', html)
-
-    if not image_url:
-        m = re.search(r'<img[^>]+src="([^"]+)"[^>]*style="[^"]*object-fit[^"]*"', html)
-
-    if not image_url:
-        raise Exception("No se pudo extraer la imagen de Instagram.")
-
-    if image_url.startswith("//"):
-        image_url = "https:" + image_url
-
-    img_resp = requests.get(image_url, headers=headers, timeout=60)
-    img_resp.raise_for_status()
-
-    ext = "jpg"
-    ct = img_resp.headers.get("Content-Type", "")
-    if "png" in ct:
-        ext = "png"
-    elif "webp" in ct:
-        ext = "webp"
-
-    filename = os.path.join(tempfile.gettempdir(), f"instagram_{int(time.time())}.{ext}")
-    with open(filename, "wb") as f:
-        f.write(img_resp.content)
-
-    return filename, "Instagram Photo"
-
-def _tiktok_api_fallback(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
-    resp = requests.post("https://tikwm.com/api/", data={"url": url.split("?")[0]}, headers=headers, timeout=30)
-    data = resp.json()
-    if data.get("code") != 0:
-        return None
-    result = data.get("data", {})
-    images = result.get("images", [])
-    music_url = result.get("music_info", {}).get("play", "")
-    if not images:
-        return None
-    slideshow_formats = [{"url": img, "ext": "jpg"} for img in images]
-    audio_formats = []
-    if music_url:
-        audio_formats = [{"url": music_url, "ext": "mp3"}]
-    return (slideshow_formats, audio_formats, images)
-
-
+        await update.message.reply_text(
+            "Uso: /blacklist — ver lista\n/blacklist add <dominio>\n/blacklist remove <dominio>"
+        )
 
 async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -191,6 +286,7 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not stored:
         await query.edit_message_text("❌ Esta solicitud ya expiró.")
         return
+
     url = stored["url"]
     loop = asyncio.get_running_loop()
 
@@ -207,23 +303,30 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not img_url:
         await query.edit_message_text("❌ No se pudo obtener la URL de la imagen.")
         return
+
     ext = sf.get("ext", "jpg")
     filename = os.path.join(tempfile.gettempdir(), f"tiktok_img_{int(time.time())}.{ext}")
-    r = requests.get(img_url, timeout=60)
-    r.raise_for_status()
-    with open(filename, "wb") as f:
-        f.write(r.content)
-    await query.edit_message_text("📤 Subiendo a Telegram...")
-    with open(filename, "rb") as f:
-        await query.message.reply_photo(
-            photo=f,
-            caption=f"📥 Descargado por @{stored['context'].bot.username}\n🔗 {url}",
-        )
-    os.remove(filename)
-    try:
-        await query.delete_message()
-    except Exception:
-        pass
+
+    with temp_file_cleanup() as cleanup:
+        cleanup.append(filename)
+        try:
+            r = requests.get(img_url, timeout=60)
+            r.raise_for_status()
+            with open(filename, "wb") as f:
+                f.write(r.content)
+
+            await query.edit_message_text("📤 Subiendo a Telegram...")
+            with open(filename, "rb") as f:
+                await query.message.reply_photo(
+                    photo=f,
+                    caption=f"📥 Descargado por @{stored['context'].bot.username}\n🔗 {url}",
+                )
+            try:
+                await query.delete_message()
+            except Exception:
+                pass
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error: {str(e)[:200]}")
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -234,78 +337,73 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     blacklist = load_blacklist()
     if any(domain in url.lower() for domain in blacklist):
-        await update.message.reply_text("🚫 Este dominio está en la lista negra y no puede descargarse.")
+        await update.message.reply_text("🚫 Este dominio está en la lista negra.")
         return
 
     processing_msg = await update.message.reply_text("⏳ Analizando enlace...")
+    loop = asyncio.get_running_loop()
 
-    try:
-        loop = asyncio.get_running_loop()
-        is_instagram = "instagram.com" in url
-        is_tiktok = "tiktok.com" in url
+    is_tiktok = "tiktok.com" in url
 
-        # --- TikTok slideshow detection ---
-        if is_tiktok:
-            clean_url = url.split("?")[0]
-            if "/photo/" in clean_url:
-                clean_url = clean_url.replace("/photo/", "/video/")
+    # --- TikTok slideshow ---
+    if is_tiktok:
+        clean_url = url.split("?")[0]
+        if "/photo/" in clean_url:
+            clean_url = clean_url.replace("/photo/", "/video/")
 
+        slideshow_data = None
+        try:
             def try_ydl():
                 with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                     return ydl.extract_info(clean_url, download=False)
+            info = await loop.run_in_executor(_download_executor, try_ydl)
+            formats = info.get("formats", [])
+            slideshow_formats = [f for f in formats if f.get("format_id", "").startswith("slideshow-")]
+            if slideshow_formats:
+                audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"]
+                slideshow_data = (slideshow_formats, audio_formats, None)
+        except Exception:
+            pass
 
-            slideshow_data = None
+        if not slideshow_data:
             try:
-                info = await loop.run_in_executor(_download_executor, try_ydl)
-                formats = info.get("formats", [])
-                slideshow_formats = [f for f in formats if f.get("format_id", "").startswith("slideshow-")]
-                if slideshow_formats:
-                    audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"]
-                    slideshow_data = (slideshow_formats, audio_formats, None)
+                api_data = await loop.run_in_executor(_download_executor, _tiktok_api_fallback, url)
+                if api_data:
+                    slideshow_data = api_data
             except Exception:
                 pass
 
-            if not slideshow_data:
-                try:
-                    api_data = await loop.run_in_executor(_download_executor, _tiktok_api_fallback, url)
-                    if api_data:
-                        slideshow_data = api_data
-                except Exception:
-                    pass
+        if slideshow_data:
+            slideshow_formats, audio_formats, api_images = slideshow_data
+            await processing_msg.edit_text("⏳ Descargando imágenes...")
 
-            if slideshow_data:
-                slideshow_formats, audio_formats, api_images = slideshow_data
-
-                if len(slideshow_formats) == 1 and audio_formats:
-                    pass  # falls through to multi-image logic below (downloads as single image)
-
-                await processing_msg.edit_text("⏳ Descargando imágenes...")
-
-                def dl_slideshow():
-                    paths = []
-                    targets = api_images if api_images else [sf.get("url") for sf in slideshow_formats]
-                    for i, img_url in enumerate(targets):
-                        if not img_url:
-                            continue
-                        ext = "jpg"
-                        path = os.path.join(
-                            tempfile.gettempdir(),
-                            f"tiktok_slide_{int(time.time())}_{i}.{ext}",
-                        )
+            def dl_slideshow():
+                paths = []
+                targets = api_images if api_images else [sf.get("url") for sf in slideshow_formats]
+                for i, img_url in enumerate(targets):
+                    if not img_url:
+                        continue
+                    path = os.path.join(tempfile.gettempdir(), f"tiktok_slide_{int(time.time())}_{i}.jpg")
+                    try:
                         r = requests.get(img_url, timeout=60)
                         r.raise_for_status()
                         with open(path, "wb") as f:
                             f.write(r.content)
                         paths.append(path)
-                    return paths
+                    except Exception as e:
+                        logging.warning(f"Fallo descarga imagen {i}: {e}")
+                return paths
 
-                img_paths = await loop.run_in_executor(_download_executor, dl_slideshow)
-                if not img_paths:
-                    await processing_msg.edit_text("❌ No se pudieron descargar las imágenes.")
-                    return
+            img_paths = await loop.run_in_executor(_download_executor, dl_slideshow)
+            if not img_paths:
+                await processing_msg.edit_text("❌ No se pudieron descargar las imágenes.")
+                return
 
+            with temp_file_cleanup() as cleanup:
+                cleanup.extend(img_paths)
                 await processing_msg.edit_text("📤 Subiendo a Telegram...")
                 caption_text = f"📥 Descargado por @{context.bot.username}\n🔗 {url}"
+
                 for batch_start in range(0, len(img_paths), 10):
                     batch = img_paths[batch_start:batch_start + 10]
                     media_group = []
@@ -316,91 +414,89 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             else:
                                 media_group.append(InputMediaPhoto(f))
                     await update.message.reply_media_group(media_group)
-                for p in img_paths:
-                    os.remove(p)
-                try:
-                    await processing_msg.delete()
-                except Exception:
-                    pass
-                return
 
-        # --- Normal download ---
-        tracker = ProgressTracker(loop, processing_msg)
-
-        def download():
-            if is_instagram:
-                try:
-                    fname, ftitle = download_instagram_photo(url)
-                    return fname, ftitle, 0, False, True
-                except Exception:
-                    pass
-            opts = get_ydl_opts(tracker.hook)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
-                title = info.get("title", "Video")
-                duration = info.get("duration", 0)
-                is_video = info.get("is_video", True) or bool(info.get("duration"))
-                if not os.path.exists(filename):
-                    base = os.path.splitext(filename)[0]
-                    for f in os.listdir(tempfile.gettempdir()):
-                        if f.startswith(os.path.basename(base)):
-                            filename = os.path.join(tempfile.gettempdir(), f)
-                            break
-                return filename, title, duration, is_video, False
-
-        result = await loop.run_in_executor(_download_executor, download)
-        filename, title, duration, is_video, is_photo = result
-        file_size = os.path.getsize(filename)
-
-        if file_size > 50 * 1024 * 1024:
-            os.remove(filename)
-            await processing_msg.edit_text(
-                "❌ El archivo pesa más de 50 MB.\n"
-                "Telegram no permite enviar archivos tan grandes a través de bots normales."
-            )
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
             return
 
-        await processing_msg.edit_text("📤 Subiendo a Telegram...")
+    # --- Descarga normal con fallback ---
+    tracker = ProgressTracker(loop, processing_msg)
 
-        if is_video:
-            with open(filename, "rb") as f:
-                await update.message.reply_video(
-                    video=f,
-                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
-                    duration=duration if duration else None,
-                    supports_streaming=True,
+    with temp_file_cleanup() as cleanup:
+        try:
+            result = await loop.run_in_executor(
+                _download_executor,
+                download_with_fallback,
+                url,
+                tracker.hook
+            )
+            filename, title, duration, is_video, _ = result
+            cleanup.append(filename)
+            tracker.close()
+
+            file_size = os.path.getsize(filename)
+            if file_size > 50 * 1024 * 1024:
+                await processing_msg.edit_text(
+                    "❌ El archivo pesa más de 50 MB.\n"
+                    "Telegram no permite enviar archivos tan grandes a través de bots normales."
                 )
-        else:
-            with open(filename, "rb") as f:
-                await update.message.reply_photo(
-                    photo=f,
-                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
-                )
+                return
 
-        os.remove(filename)
+            await processing_msg.edit_text("📤 Subiendo a Telegram...")
 
-    except yt_dlp.utils.DownloadError as e:
-        try:
-            await processing_msg.edit_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
-        except Exception:
-            pass
-        try:
-            await update.message.reply_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
-        except Exception:
-            pass
-    except Exception as e:
-        msg = str(e)[:200]
-        try:
-            await processing_msg.edit_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
-        except Exception:
-            pass
-        try:
-            await update.message.reply_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
-        except Exception:
-            pass
-    else:
-        await processing_msg.delete()
+            if is_video:
+                with open(filename, "rb") as f:
+                    await update.message.reply_video(
+                        video=f,
+                        caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                        duration=duration if duration else None,
+                        supports_streaming=True,
+                    )
+            else:
+                with open(filename, "rb") as f:
+                    await update.message.reply_photo(
+                        photo=f,
+                        caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                    )
+
+            try:
+                await processing_msg.delete()
+            except Exception:
+                pass
+
+        except yt_dlp.utils.DownloadError as e:
+            err_msg = str(e)
+            # Mensajes amigables para errores comunes
+            if "Sign in to confirm" in err_msg or "confirm your age" in err_msg:
+                friendly = "❌ YouTube requiere verificación de edad o login. Prueba con otro video."
+            elif "Private video" in err_msg:
+                friendly = "❌ Este video es privado."
+            elif "This video is not available" in err_msg:
+                friendly = "❌ Este video no está disponible (puede estar restringido por región)."
+            elif "HTTP Error 429" in err_msg or "too many requests" in err_msg.lower():
+                friendly = "❌ Demasiadas peticiones. Espera unos minutos e intenta de nuevo."
+            elif "Unable to extract" in err_msg:
+                friendly = "❌ No se pudo extraer el video. El sitio puede haber cambiado su estructura."
+            else:
+                friendly = f"❌ Error de descarga:\n`{err_msg[:300]}`"
+
+            try:
+                await processing_msg.edit_text(friendly, parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(friendly, parse_mode="Markdown")
+
+        except Exception as e:
+            logging.exception("Error inesperado en download_video")
+            msg = str(e)[:300]
+            try:
+                await processing_msg.edit_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
+            except Exception:
+                await update.message.reply_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
+
+# --- Setup del bot ---
+application = Application.builder().token(TOKEN).build()
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("blacklist", blacklist_cmd))
@@ -436,23 +532,4 @@ def ensure_bot():
             logging.info("Bot inicializado correctamente")
             return True
         except Exception as e:
-            logging.error(f"Error inicializando bot: {e}")
-            return False
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    if not ensure_bot():
-        return "Bot not ready", 503
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run_coroutine_threadsafe(application.process_update(update), _bot_loop)
-    return "OK", 200
-
-@app.route("/")
-@app.route("/health")
-def health():
-    if not _bot_ready:
-        return "Bot not ready", 503
-    return "OK", 200
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+ 
