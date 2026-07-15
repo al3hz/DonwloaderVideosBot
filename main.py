@@ -11,7 +11,10 @@ from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
-import requests
+import requests 
+
+from dotenv import load_dotenv
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 
