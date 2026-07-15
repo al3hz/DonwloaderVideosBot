@@ -85,7 +85,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(filename, "rb") as video_file:
             await update.message.reply_video(
                 video=video_file,
-                caption=f"✅ {title}",
+                caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
                 duration=duration if duration else None,
                 supports_streaming=True,
             )
