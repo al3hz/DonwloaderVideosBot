@@ -200,11 +200,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_instagram = "instagram.com" in url
         is_tiktok = "tiktok.com" in url
 
-        # --- TikTok photos (via API) ---
+        # --- TikTok photos ---
         if is_tiktok and "/photo/" in url:
             api_data = await loop.run_in_executor(_download_executor, _tiktok_api_fallback, url)
             if api_data:
-                slideshow_formats, _, images = api_data
+                _, _, images = api_data
 
                 def dl_slideshow():
                     paths = []
@@ -239,6 +239,9 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     for p in img_paths:
                         os.remove(p)
                     return
+
+            # Fallback: try yt-dlp with /video/ conversion
+            url = url.split("?")[0].replace("/photo/", "/video/")
 
         # --- Normal download ---
         tracker = ProgressTracker(loop, processing_msg)
