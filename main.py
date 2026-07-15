@@ -1,7 +1,4 @@
 import os
-import re
-import json
-import time
 import asyncio
 import threading
 import tempfile
@@ -10,7 +7,6 @@ from flask import Flask, request
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
-import requests
 
 logging.basicConfig(level=logging.INFO)
 
@@ -39,94 +35,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-DOWNLOAD_DIR = tempfile.gettempdir()
-
 def get_ydl_opts():
     return {
         "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
-        "outtmpl": os.path.join(DOWNLOAD_DIR, "%(id)s.%(ext)s"),
+        "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
         "quiet": True,
         "no_warnings": True,
     }
-
-def download_pornhub(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://www.pornhub.com/",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    html = resp.text
-
-    video_url = None
-    title = "PornHub Video"
-
-    # Try to find video URL in various patterns
-    patterns = [
-        r'videoUrl\s*=\s*["\']([^"\']+)["\']',
-        r'"video_url"\s*:\s*"([^"]+)"',
-        r'qualityItems\s*=\s*(\[.*?\]);',
-        r'data-video-url\s*=\s*"([^"]+)"',
-        r'mediaDefinitions\s*:\s*(\[.*?\])',
-        r'<video[^>]+>.*?<source[^>]+src="([^"]+)"',
-        r'<meta\s+property="og:video"\s+content="([^"]+)"',
-        r'<meta\s+property="og:video:secure_url"\s+content="([^"]+)"',
-        r'var\s+videoUrl\s*=\s*"([^"]+)"',
-        r'let\s+videoUrl\s*=\s*"([^"]+)"',
-        r'const\s+videoUrl\s*=\s*"([^"]+)"',
-        r'"defaultQuality"\s*:\s*"[^"]*".*?"url"\s*:\s*"([^"]+)"',
-        r'videoUrl["\']?\s*[:=]\s*["\']([^"\']+)["\']',
-    ]
-
-    for p in patterns:
-        m = re.search(p, html, re.IGNORECASE | re.DOTALL)
-        if m:
-            found = m.group(1)
-            if found.startswith("http") or found.startswith("//"):
-                video_url = found
-                break
-
-    # Try JSON extraction from script tags
-    if not video_url:
-        script_patterns = [
-            r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-            r'window\.__NUXT__\s*=\s*({.*?});',
-            r'<script[^>]*>\s*window\.__data\s*=\s*({.*?});\s*</script>',
-            r'<script[^>]*>\s*window\.pageData\s*=\s*({.*?});\s*</script>',
-        ]
-        for sp in script_patterns:
-            m = re.search(sp, html, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(1))
-                    raw = json.dumps(data)
-                    vu = re.search(r'"videoUrl"\s*:\s*"([^"]+)"', raw)
-                    if vu:
-                        video_url = vu.group(1).replace("\\/", "/")
-                    if not video_url:
-                        vu = re.search(r'"url"\s*:\s*"([^"]+\.mp4[^"]*)"', raw)
-                        if vu:
-                            video_url = vu.group(1).replace("\\/", "/")
-                except json.JSONDecodeError:
-                    pass
-
-    if not video_url:
-        raise Exception("No se pudo encontrar el video en la página de PornHub.")
-
-    if video_url.startswith("//"):
-        video_url = "https:" + video_url
-
-    vid_resp = requests.get(video_url, headers=headers, timeout=120)
-    vid_resp.raise_for_status()
-
-    filename = os.path.join(DOWNLOAD_DIR, f"pornhub_{int(time.time())}.mp4")
-    with open(filename, "wb") as f:
-        f.write(vid_resp.content)
-
-    return filename, title, 0
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -139,11 +54,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         loop = asyncio.get_running_loop()
-        is_pornhub = "pornhub.com" in url
 
         def download():
-            if is_pornhub:
-                return download_pornhub(url)
             with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
@@ -151,9 +63,9 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 duration = info.get("duration", 0)
                 if not os.path.exists(filename):
                     base = os.path.splitext(filename)[0]
-                    for f in os.listdir(DOWNLOAD_DIR):
+                    for f in os.listdir(tempfile.gettempdir()):
                         if f.startswith(os.path.basename(base)):
-                            filename = os.path.join(DOWNLOAD_DIR, f)
+                            filename = os.path.join(tempfile.gettempdir(), f)
                             break
                 return filename, title, duration
 
