@@ -9,8 +9,8 @@ import logging
 import subprocess
 import concurrent.futures
 from flask import Flask, request
-from telegram import Update, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
 import requests 
 
@@ -161,25 +161,98 @@ def download_instagram_photo(url):
 
     return filename, "Instagram Photo"
 
-def _tiktok_api_fallback(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
-    resp = requests.post("https://tikwm.com/api/", data={"url": url.split("?")[0]}, headers=headers, timeout=30)
-    data = resp.json()
-    if data.get("code") != 0:
-        return None
-    result = data.get("data", {})
-    images = result.get("images", [])
-    music_url = result.get("music_info", {}).get("play", "")
-    if not images:
-        return None
-    slideshow_formats = [{"url": img, "ext": "jpg"} for img in images]
-    audio_formats = []
-    if music_url:
-        audio_formats = [{"url": music_url, "ext": "mp3"}]
-    return (slideshow_formats, audio_formats, images)
+def combine_image_audio(image_path, audio_path, output_path):
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1", audio_path],
+        capture_output=True, text=True, timeout=30
+    )
+    duration = float(probe.stdout.strip())
+    subprocess.run(
+        ["ffmpeg", "-y", "-loop", "1", "-i", image_path, "-i", audio_path,
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+         "-t", str(duration), "-shortest", output_path],
+        capture_output=True, timeout=300
+    )
+    return output_path if os.path.exists(output_path) else None
+
+async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    key = f"tiktok:{query.message.message_id}"
+    stored = context.user_data.pop(key, None)
+    if not stored:
+        await query.edit_message_text("❌ Esta solicitud ya expiró.")
+        return
+    url = stored["url"]
+    info = stored["info"]
+    loop = asyncio.get_running_loop()
+
+    if query.data == "tiktok_image":
+        await query.edit_message_text("⏳ Descargando imagen...")
+        sf = stored["slideshow_format"]
+        img_url = sf.get("url")
+        if not img_url:
+            await query.edit_message_text("❌ No se pudo obtener la URL de la imagen.")
+            return
+        ext = sf.get("ext", "jpg")
+        filename = os.path.join(tempfile.gettempdir(), f"tiktok_img_{int(time.time())}.{ext}")
+        r = requests.get(img_url, timeout=60)
+        r.raise_for_status()
+        with open(filename, "wb") as f:
+            f.write(r.content)
+        await query.edit_message_text("📤 Subiendo a Telegram...")
+        with open(filename, "rb") as f:
+            await query.message.reply_photo(
+                photo=f,
+                caption=f"📥 Descargado por @{stored['context'].bot.username}\n🔗 {url}",
+            )
+        os.remove(filename)
+        return
+
+    await query.edit_message_text("⏳ Descargando imagen y audio...")
+    sf = stored["slideshow_format"]
+    af = stored["audio_format"]
+    img_url = sf.get("url")
+    audio_url = af.get("url")
+    if not img_url or not audio_url:
+        await query.edit_message_text("❌ No se pudieron obtener las URLs de descarga.")
+        return
+    img_ext = sf.get("ext", "jpg")
+    audio_ext = af.get("ext", "m4a")
+    ts = int(time.time())
+    img_path = os.path.join(tempfile.gettempdir(), f"tiktok_img_{ts}.{img_ext}")
+    audio_path = os.path.join(tempfile.gettempdir(), f"tiktok_audio_{ts}.{audio_ext}")
+
+    def dl_both():
+        r1 = requests.get(img_url, timeout=60)
+        r1.raise_for_status()
+        with open(img_path, "wb") as f:
+            f.write(r1.content)
+        r2 = requests.get(audio_url, timeout=120)
+        r2.raise_for_status()
+        with open(audio_path, "wb") as f:
+            f.write(r2.content)
+
+    await loop.run_in_executor(_download_executor, dl_both)
+
+    await query.edit_message_text("⏳ Combinando imagen con audio...")
+    output = os.path.join(tempfile.gettempdir(), f"tiktok_video_{ts}.mp4")
+    result = await loop.run_in_executor(_download_executor, combine_image_audio, img_path, audio_path, output)
+    os.remove(img_path)
+    os.remove(audio_path)
+    if not result:
+        await query.edit_message_text("❌ Error al crear el video.")
+        return
+
+    await query.edit_message_text("📤 Subiendo a Telegram...")
+    with open(output, "rb") as f:
+        await query.message.reply_video(
+            video=f,
+            caption=f"📥 Descargado por @{stored['context'].bot.username}\n🔗 {url}",
+            supports_streaming=True,
+        )
+    os.remove(output)
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     url = update.message.text.strip()
@@ -200,20 +273,52 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         is_instagram = "instagram.com" in url
         is_tiktok = "tiktok.com" in url
 
-        # --- TikTok photos ---
-        if is_tiktok and "/photo/" in url:
-            api_data = await loop.run_in_executor(_download_executor, _tiktok_api_fallback, url)
-            if api_data:
-                _, _, images = api_data
+        # --- TikTok slideshow detection ---
+        if is_tiktok:
+            if "/photo/" in url:
+                url = url.replace("/photo/", "/video/")
+            def extract_info():
+                with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
+                    return ydl.extract_info(url, download=False)
+
+            info = await loop.run_in_executor(_download_executor, extract_info)
+            formats = info.get("formats", [])
+            slideshow_formats = [f for f in formats if f.get("format_id", "").startswith("slideshow-")]
+
+            if slideshow_formats:
+                audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"]
+
+                if len(slideshow_formats) == 1 and audio_formats:
+                    await processing_msg.edit_text("🖼️ TikTok: foto con audio.")
+                    keyboard = [[
+                        InlineKeyboardButton("🎬 Video (foto+audio)", callback_data="tiktok_video"),
+                        InlineKeyboardButton("🖼️ Solo imagen", callback_data="tiktok_image"),
+                    ]]
+                    ask_msg = await update.message.reply_text(
+                        "¿Cómo quieres descargarlo?",
+                        reply_markup=InlineKeyboardMarkup(keyboard),
+                    )
+                    context.user_data[f"tiktok:{ask_msg.message_id}"] = {
+                        "url": url,
+                        "info": info,
+                        "slideshow_format": slideshow_formats[0],
+                        "audio_format": audio_formats[0],
+                        "context": context,
+                    }
+                    return
+
+                await processing_msg.edit_text("⏳ Descargando imágenes...")
 
                 def dl_slideshow():
                     paths = []
-                    for i, img_url in enumerate(images):
+                    for sf in slideshow_formats:
+                        img_url = sf.get("url")
                         if not img_url:
                             continue
+                        ext = sf.get("ext", "jpg")
                         path = os.path.join(
                             tempfile.gettempdir(),
-                            f"tiktok_slide_{int(time.time())}_{i}.jpg",
+                            f"tiktok_slide_{int(time.time())}_{sf['format_id']}.{ext}",
                         )
                         r = requests.get(img_url, timeout=60)
                         r.raise_for_status()
@@ -223,25 +328,24 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return paths
 
                 img_paths = await loop.run_in_executor(_download_executor, dl_slideshow)
-                if img_paths:
-                    for batch_start in range(0, len(img_paths), 10):
-                        batch = img_paths[batch_start:batch_start + 10]
-                        media_group = []
-                        for i, path in enumerate(batch):
-                            with open(path, "rb") as f:
-                                if batch_start == 0 and i == 0:
-                                    media_group.append(
-                                        InputMediaPhoto(f, caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}")
-                                    )
-                                else:
-                                    media_group.append(InputMediaPhoto(f))
-                        await update.message.reply_media_group(media_group)
-                    for p in img_paths:
-                        os.remove(p)
+                if not img_paths:
+                    await processing_msg.edit_text("❌ No se pudieron descargar las imágenes.")
                     return
 
-            # Fallback: try yt-dlp with /video/ conversion
-            url = url.split("?")[0].replace("/photo/", "/video/")
+                await processing_msg.edit_text("📤 Subiendo a Telegram...")
+                media_group = []
+                for i, path in enumerate(img_paths):
+                    with open(path, "rb") as f:
+                        if i == 0:
+                            media_group.append(
+                                InputMediaPhoto(f, caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}")
+                            )
+                        else:
+                            media_group.append(InputMediaPhoto(f))
+                await update.message.reply_media_group(media_group)
+                for p in img_paths:
+                    os.remove(p)
+                return
 
         # --- Normal download ---
         tracker = ProgressTracker(loop, processing_msg)
@@ -280,35 +384,22 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        size_mb = file_size / 1024 / 1024
-        base_text = f"📤 Subiendo {size_mb:.1f} MB"
+        await processing_msg.edit_text("📤 Subiendo a Telegram...")
 
-        async def animate():
-            dots = 0
-            while True:
-                await processing_msg.edit_text(f"{base_text}{'.' * dots}")
-                dots = (dots + 1) % 4
-                await asyncio.sleep(1)
-
-        anim_task = asyncio.create_task(animate())
-
-        try:
-            if is_video:
-                with open(filename, "rb") as f:
-                    await update.message.reply_video(
-                        video=f,
-                        caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
-                        duration=duration if duration else None,
-                        supports_streaming=True,
-                    )
-            else:
-                with open(filename, "rb") as f:
-                    await update.message.reply_photo(
-                        photo=f,
-                        caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
-                    )
-        finally:
-            anim_task.cancel()
+        if is_video:
+            with open(filename, "rb") as f:
+                await update.message.reply_video(
+                    video=f,
+                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                    duration=duration if duration else None,
+                    supports_streaming=True,
+                )
+        else:
+            with open(filename, "rb") as f:
+                await update.message.reply_photo(
+                    photo=f,
+                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                )
 
         os.remove(filename)
 
@@ -336,6 +427,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("blacklist", blacklist_cmd))
+application.add_handler(CallbackQueryHandler(tiktok_callback, pattern="^tiktok_"))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
 _bot_loop = None
