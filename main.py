@@ -264,6 +264,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- TikTok slideshow detection ---
         if is_tiktok:
+            if "/photo/" in url:
+                url = url.replace("/photo/", "/video/")
             def extract_info():
                 with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                     return ydl.extract_info(url, download=False)
