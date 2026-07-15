@@ -55,18 +55,7 @@ YTDLP_COMMON_OPTS = {
         "Sec-Fetch-User": "?1",
         "Cache-Control": "max-age=0",
     },
-    # Cookies: si tienes un cookies.txt en el proyecto, úsalo
-    # "cookies": "cookies.txt" if os.path.exists("cookies.txt") else None,
 }
-
-# Formato robusto: NO usar filesize porque YouTube no lo reporta para DASH
-# Primero intenta H.264 (compatible), luego cualquier best
-YTDLP_FORMAT = (
-    "bestvideo[height<=1080][vcodec^=avc]+bestaudio[ext=m4a]/"
-    "bestvideo[height<=1080]+bestaudio/"
-    "best[height<=1080]/"
-    "best"
-)
 
 def load_blacklist():
     if os.path.exists(BLACKLIST_FILE):
@@ -116,7 +105,6 @@ class ProgressTracker:
 
         with self._lock:
             now = time.time()
-            # Mínimo 3 segundos entre edits para evitar rate limit de Telegram
             if pct - self.last_pct < 10 and now - self.last_update < 3 and pct != 100:
                 return
             if self._closed or not self.loop or self.loop.is_closed():
@@ -136,18 +124,15 @@ class ProgressTracker:
         self._closed = True
 
 def get_ydl_opts(progress_hook=None, extra_opts=None):
-    opts = {**YTDLP_COMMON_OPTS, "format": YTDLP_FORMAT}
+    opts = dict(YTDLP_COMMON_OPTS)
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     if extra_opts:
         opts.update(extra_opts)
     return opts
 
-# --- Descarga con fallback de formatos ---
+# --- Descarga con fallback de formatos (ELIMINA filesize<50M) ---
 def download_with_fallback(url, progress_hook=None):
-    """
-    Intenta descargar con formato H.264, si falla prueba formatos más permisivos.
-    """
     attempts = [
         # Intento 1: H.264 1080p + AAC (máxima compatibilidad)
         {
@@ -164,7 +149,7 @@ def download_with_fallback(url, progress_hook=None):
             "format": "best/bestvideo+bestaudio",
             "merge_output_format": "mp4",
         },
-        # Intento 4: Forzar extractor genérico (útil para Reddit con URLs directas)
+        # Intento 4: Forzar extractor genérico (Reddit con URLs directas)
         {
             "format": "best",
             "force_generic_extractor": True,
@@ -188,7 +173,7 @@ def download_with_fallback(url, progress_hook=None):
                     for f in os.listdir(tempfile.gettempdir()):
                         if f.startswith(os.path.basename(base)):
                             candidate = os.path.join(tempfile.gettempdir(), f)
-                            if os.path.getsize(candidate) > 1024:  # > 1KB = válido
+                            if os.path.getsize(candidate) > 1024:
                                 filename = candidate
                                 break
 
@@ -204,7 +189,7 @@ def download_with_fallback(url, progress_hook=None):
 
     raise last_error
 
-# --- TikTok API fallback (sin cambios mayores) ---
+# --- TikTok API fallback ---
 def _tiktok_api_fallback(url):
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -288,8 +273,6 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     url = stored["url"]
-    loop = asyncio.get_running_loop()
-
     proc_id = stored.get("processing_msg_id")
     if proc_id:
         try:
@@ -319,7 +302,7 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(filename, "rb") as f:
                 await query.message.reply_photo(
                     photo=f,
-                    caption=f"📥 Descargado por @{stored['context'].bot.username}\n🔗 {url}",
+                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
                 )
             try:
                 await query.delete_message()
@@ -404,16 +387,21 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await processing_msg.edit_text("📤 Subiendo a Telegram...")
                 caption_text = f"📥 Descargado por @{context.bot.username}\n🔗 {url}"
 
-                for batch_start in range(0, len(img_paths), 10):
-                    batch = img_paths[batch_start:batch_start + 10]
-                    media_group = []
-                    for i, path in enumerate(batch):
-                        with open(path, "rb") as f:
-                            if batch_start == 0 and i == 0:
-                                media_group.append(InputMediaPhoto(f, caption=caption_text))
-                            else:
-                                media_group.append(InputMediaPhoto(f))
+                # Abrimos los archivos ordenadamente para armar el media group
+                opened_files = []
+                try:
+                    for i, path in enumerate(img_paths[:10]):  # Límite máximo de 10 elementos por grupo
+                        f = open(path, "rb")
+                        opened_files.append(f)
+                        if i == 0:
+                            media_group = [InputMediaPhoto(f, caption=caption_text)]
+                        else:
+                            media_group.append(InputMediaPhoto(f))
+                    
                     await update.message.reply_media_group(media_group)
+                finally:
+                    for f in opened_files:
+                        f.close()
 
             try:
                 await processing_msg.delete()
@@ -468,7 +456,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         except yt_dlp.utils.DownloadError as e:
             err_msg = str(e)
-            # Mensajes amigables para errores comunes
             if "Sign in to confirm" in err_msg or "confirm your age" in err_msg:
                 friendly = "❌ YouTube requiere verificación de edad o login. Prueba con otro video."
             elif "Private video" in err_msg:
@@ -479,6 +466,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 friendly = "❌ Demasiadas peticiones. Espera unos minutos e intenta de nuevo."
             elif "Unable to extract" in err_msg:
                 friendly = "❌ No se pudo extraer el video. El sitio puede haber cambiado su estructura."
+            elif "Requested format is not available" in err_msg:
+                friendly = "❌ No se encontró un formato compatible. Prueba con otro enlace."
             else:
                 friendly = f"❌ Error de descarga:\n`{err_msg[:300]}`"
 
@@ -532,4 +521,19 @@ def ensure_bot():
             logging.info("Bot inicializado correctamente")
             return True
         except Exception as e:
- 
+            logging.error(f"Error inicializando bot: {e}")
+            return False
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if not ensure_bot():
+        return "Bot not ready", 503
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    asyncio.run_coroutine_threadsafe(application.process_update(update), _bot_loop)
+    return "OK", 200
+
+@app.route("/")
+@app.route("/health")
+def health():
+    if not _bot_ready:
+        
