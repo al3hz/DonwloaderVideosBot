@@ -7,6 +7,7 @@ import threading
 import tempfile
 import logging
 import subprocess
+import concurrent.futures
 from flask import Flask, request
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -34,6 +35,8 @@ def save_blacklist(domains):
         json.dump(list(domains), f)
 
 app = Flask(__name__)
+
+_download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="download")
 
 async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bl = load_blacklist()
@@ -86,6 +89,7 @@ class ProgressTracker:
         self.loop = loop
         self.message = message
         self.last_pct = -1
+        self._closed = False
 
     def hook(self, d):
         if d["status"] == "downloading":
@@ -94,12 +98,16 @@ class ProgressTracker:
                 pct = float(raw)
                 if pct - self.last_pct >= 5 or (pct == 100 and self.last_pct != 100):
                     self.last_pct = pct
-                    asyncio.run_coroutine_threadsafe(
-                        self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
-                        self.loop,
-                    )
+                    if not self._closed and self.loop and not self.loop.is_closed():
+                        asyncio.run_coroutine_threadsafe(
+                            self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
+                            self.loop,
+                        )
             except Exception:
                 pass
+
+    def close(self):
+        self._closed = True
 
 def get_ydl_opts(progress_hook=None):
     opts = {
@@ -226,11 +234,11 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         with open(audio_path, "wb") as f:
             f.write(r2.content)
 
-    await loop.run_in_executor(None, dl_both)
+    await loop.run_in_executor(_download_executor, dl_both)
 
     await query.edit_message_text("⏳ Combinando imagen con audio...")
     output = os.path.join(tempfile.gettempdir(), f"tiktok_video_{ts}.mp4")
-    result = await loop.run_in_executor(None, combine_image_audio, img_path, audio_path, output)
+    result = await loop.run_in_executor(_download_executor, combine_image_audio, img_path, audio_path, output)
     os.remove(img_path)
     os.remove(audio_path)
     if not result:
@@ -273,7 +281,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                     return ydl.extract_info(url, download=False)
 
-            info = await loop.run_in_executor(None, extract_info)
+            info = await loop.run_in_executor(_download_executor, extract_info)
             formats = info.get("formats", [])
             slideshow_formats = [f for f in formats if f.get("format_id", "").startswith("slideshow-")]
 
@@ -319,7 +327,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         paths.append(path)
                     return paths
 
-                img_paths = await loop.run_in_executor(None, dl_slideshow)
+                img_paths = await loop.run_in_executor(_download_executor, dl_slideshow)
                 if not img_paths:
                     await processing_msg.edit_text("❌ No se pudieron descargar las imágenes.")
                     return
@@ -364,7 +372,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             break
                 return filename, title, duration, is_video, False
 
-        result = await loop.run_in_executor(None, download)
+        result = await loop.run_in_executor(_download_executor, download)
         filename, title, duration, is_video, is_photo = result
         file_size = os.path.getsize(filename)
 
@@ -396,10 +404,24 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(filename)
 
     except yt_dlp.utils.DownloadError as e:
-        await processing_msg.edit_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
+        try:
+            await processing_msg.edit_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
+        except Exception:
+            pass
+        try:
+            await update.message.reply_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
+        except Exception:
+            pass
     except Exception as e:
         msg = str(e)[:200]
-        await processing_msg.edit_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
+        try:
+            await processing_msg.edit_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
+        except Exception:
+            pass
+        try:
+            await update.message.reply_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
+        except Exception:
+            pass
     else:
         await processing_msg.delete()
 
