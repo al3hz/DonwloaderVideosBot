@@ -450,5 +450,13 @@ def webhook():
 def health():
     return "OK", 200
 
+def _init_bot_sync():
+    global _bot_ready, _bot_loop
+    _bot_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_bot_loop)
+    _bot_loop.run_until_complete(_init_bot())
+
 if __name__ == "__main__":
+    if RENDER_EXTERNAL_URL:
+        _init_bot_sync()
     app.run(host="0.0.0.0", port=PORT)
