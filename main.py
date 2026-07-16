@@ -115,7 +115,7 @@ class ProgressTracker:
 
 def get_ydl_opts(progress_hook=None):
     opts = {
-        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best[filesize<50M]",
+        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
         "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "socket_timeout": 30,
@@ -125,51 +125,6 @@ def get_ydl_opts(progress_hook=None):
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     return opts
-
-def download_instagram_photo(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept-Language": "en-US,en;q=0.5",
-    }
-    resp = requests.get(url, headers=headers, timeout=30)
-    html = resp.text
-
-    image_url = None
-    og = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
-    if og:
-        image_url = og.group(1)
-
-    if not image_url:
-        tw = re.search(r'<meta\s+name="twitter:image"\s+content="([^"]+)"', html)
-        if tw:
-            image_url = tw.group(1)
-
-    if not image_url:
-        m = re.search(r'<img[^>]+src="([^"]+)"[^>]*style="[^"]*object-fit[^"]*"', html)
-        if m:
-            image_url = m.group(1)
-
-    if not image_url:
-        raise Exception("No se pudo extraer la imagen de Instagram.")
-
-    if image_url.startswith("//"):
-        image_url = "https:" + image_url
-
-    img_resp = requests.get(image_url, headers=headers, timeout=60)
-    img_resp.raise_for_status()
-
-    ext = "jpg"
-    ct = img_resp.headers.get("Content-Type", "")
-    if "png" in ct:
-        ext = "png"
-    elif "webp" in ct:
-        ext = "webp"
-
-    filename = os.path.join(tempfile.gettempdir(), f"instagram_{int(time.time())}.{ext}")
-    with open(filename, "wb") as f:
-        f.write(img_resp.content)
-
-    return filename, "Instagram Photo"
 
 def _tiktok_api_fallback(url):
     headers = {
@@ -251,7 +206,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         loop = asyncio.get_running_loop()
-        is_instagram = "instagram.com" in url
         is_tiktok = "tiktok.com" in url
 
         # --- TikTok slideshow detection ---
@@ -342,12 +296,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         tracker = ProgressTracker(loop, processing_msg)
 
         def download():
-            if is_instagram:
-                try:
-                    fname, ftitle = download_instagram_photo(url)
-                    return fname, ftitle, 0, False, True
-                except Exception:
-                    pass
             opts = get_ydl_opts(tracker.hook)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
