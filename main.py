@@ -24,6 +24,8 @@ RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com"]
 
+COOKIES_FILE = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
+
 app = Flask(__name__)
 
 _download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="download")
@@ -85,6 +87,8 @@ def get_ydl_opts(progress_hook=None):
         "quiet": True,
         "no_warnings": True,
     }
+    if os.path.exists(COOKIES_FILE):
+        opts["cookiefile"] = COOKIES_FILE
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     return opts
@@ -314,12 +318,32 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.remove(filename)
 
     except yt_dlp.utils.DownloadError as e:
+        err_msg = str(e)
+        friendly = {
+            "No video could be found in this tweet": (
+                "❌ No se pudo encontrar un video en ese tweet.\n"
+                "Asegúrate de que el tweet contiene un video nativo (no un enlace externo).\n"
+                "Si el problema persiste, prueba desde la cuenta oficial @botfather."
+            ),
+            "Requested format is not available": (
+                "❌ No hay un formato de video disponible para este enlace."
+            ),
+            "This video is only available for registered users": (
+                "❌ Este video requiere inicio de sesión en la plataforma."
+            ),
+        }
+        for key, msg in friendly.items():
+            if key in err_msg:
+                display_msg = msg
+                break
+        else:
+            display_msg = f"❌ Error de descarga:\n`{err_msg[:200]}`"
         try:
-            await processing_msg.edit_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
+            await processing_msg.edit_text(display_msg, parse_mode="Markdown")
         except Exception:
             pass
         try:
-            await update.message.reply_text(f"❌ Error de descarga:\n`{str(e)}`", parse_mode="Markdown")
+            await update.message.reply_text(display_msg, parse_mode="Markdown")
         except Exception:
             pass
     except Exception as e:
