@@ -6,10 +6,9 @@ import asyncio
 import threading
 import tempfile
 import logging
-import subprocess
 import concurrent.futures
 from flask import Flask, request
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram import Update, InputMediaPhoto
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 import yt_dlp
 import requests 
@@ -22,45 +21,12 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
-BLACKLIST_FILE = os.path.join(tempfile.gettempdir(), "blacklist.json")
 
-def load_blacklist():
-    if os.path.exists(BLACKLIST_FILE):
-        with open(BLACKLIST_FILE) as f:
-            return set(json.load(f))
-    return set()
-
-def save_blacklist(domains):
-    with open(BLACKLIST_FILE, "w") as f:
-        json.dump(list(domains), f)
+ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com"]
 
 app = Flask(__name__)
 
 _download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="download")
-
-async def blacklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bl = load_blacklist()
-    args = context.args
-    if not args:
-        if bl:
-            text = "🚫 Dominios en lista negra:\n" + "\n".join(f"• `{d}`" for d in sorted(bl))
-        else:
-            text = "✅ No hay dominios en la lista negra."
-        await update.message.reply_text(text, parse_mode="Markdown")
-        return
-    action = args[0].lower()
-    if action == "add" and len(args) >= 2:
-        domain = args[1].lower().strip()
-        bl.add(domain)
-        save_blacklist(bl)
-        await update.message.reply_text(f"✅ `{domain}` añadido a la lista negra.", parse_mode="Markdown")
-    elif action == "remove" and len(args) >= 2:
-        domain = args[1].lower().strip()
-        bl.discard(domain)
-        save_blacklist(bl)
-        await update.message.reply_text(f"✅ `{domain}` eliminado de la lista negra.", parse_mode="Markdown")
-    else:
-        await update.message.reply_text("Uso: /blacklist — ver lista\n/blacklist add <dominio>\n/blacklist remove <dominio>")
 
 application = (
     Application.builder()
@@ -73,14 +39,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 ¡Hola! Soy tu bot de descargas.\n\n"
         "📎 Envíame un enlace de:\n"
         "• TikTok (sin marca de agua)\n"
-        "• YouTube / YouTube Shorts\n"
-        "• Twitter / X\n"
         "• Instagram (Reels)\n"
-        "• Facebook\n"
-        "• Y muchas más...\n\n"
-        "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots).\n\n"
-        "📋 Comandos:\n"
-        "  /blacklist — Ver /blacklist add <dominio> /blacklist remove <dominio>"
+        "• Twitter / X\n\n"
+        "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots)."
     )
     await update.message.reply_text(text)
 
@@ -197,9 +158,10 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Envía un enlace válido.")
         return
 
-    blacklist = load_blacklist()
-    if any(domain in url.lower() for domain in blacklist):
-        await update.message.reply_text("🚫 Este dominio está en la lista negra y no puede descargarse.")
+    if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
+        await update.message.reply_text(
+            "❌ Solo acepto enlaces de TikTok, Instagram y Twitter/X."
+        )
         return
 
     processing_msg = await update.message.reply_text("⏳ Analizando enlace...")
@@ -372,7 +334,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.delete()
 
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CommandHandler("blacklist", blacklist_cmd))
 application.add_handler(CallbackQueryHandler(tiktok_callback, pattern="^tiktok_"))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
