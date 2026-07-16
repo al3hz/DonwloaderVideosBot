@@ -90,6 +90,7 @@ class ProgressTracker:
         self.message = message
         self.last_pct = -1
         self._closed = False
+        self._lock = threading.Lock()
 
     def hook(self, d):
         if d["status"] == "downloading":
@@ -98,7 +99,9 @@ class ProgressTracker:
                 pct = float(raw)
                 if pct - self.last_pct >= 5 or (pct == 100 and self.last_pct != 100):
                     self.last_pct = pct
-                    if not self._closed and self.loop and not self.loop.is_closed():
+                    with self._lock:
+                        closed = self._closed
+                    if not closed and self.loop and not self.loop.is_closed():
                         asyncio.run_coroutine_threadsafe(
                             self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
                             self.loop,
@@ -107,12 +110,15 @@ class ProgressTracker:
                 pass
 
     def close(self):
-        self._closed = True
+        with self._lock:
+            self._closed = True
 
 def get_ydl_opts(progress_hook=None):
     opts = {
-        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
+        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best[filesize<50M]",
         "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
+        "merge_output_format": "mp4",
+        "socket_timeout": 30,
         "quiet": True,
         "no_warnings": True,
     }
@@ -134,10 +140,14 @@ def download_instagram_photo(url):
         image_url = og.group(1)
 
     if not image_url:
-        og = re.search(r'<meta\s+name="twitter:image"\s+content="([^"]+)"', html)
+        tw = re.search(r'<meta\s+name="twitter:image"\s+content="([^"]+)"', html)
+        if tw:
+            image_url = tw.group(1)
 
     if not image_url:
         m = re.search(r'<img[^>]+src="([^"]+)"[^>]*style="[^"]*object-fit[^"]*"', html)
+        if m:
+            image_url = m.group(1)
 
     if not image_url:
         raise Exception("No se pudo extraer la imagen de Instagram.")
@@ -186,7 +196,7 @@ def _tiktok_api_fallback(url):
 async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    key = f"tiktok:{query.message.message_id}"
+    key = f"tiktok:{query.message.chat_id}:{query.message.message_id}"
     stored = context.user_data.pop(key, None)
     if not stored:
         await query.edit_message_text("❌ Esta solicitud ya expiró.")
@@ -309,13 +319,17 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for batch_start in range(0, len(img_paths), 10):
                     batch = img_paths[batch_start:batch_start + 10]
                     media_group = []
+                    files = []
                     for i, path in enumerate(batch):
-                        with open(path, "rb") as f:
-                            if batch_start == 0 and i == 0:
-                                media_group.append(InputMediaPhoto(f, caption=caption_text))
-                            else:
-                                media_group.append(InputMediaPhoto(f))
+                        f = open(path, "rb")
+                        files.append(f)
+                        if batch_start == 0 and i == 0:
+                            media_group.append(InputMediaPhoto(f, caption=caption_text))
+                        else:
+                            media_group.append(InputMediaPhoto(f))
                     await update.message.reply_media_group(media_group)
+                    for f in files:
+                        f.close()
                 for p in img_paths:
                     os.remove(p)
                 try:
@@ -337,15 +351,20 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             opts = get_ydl_opts(tracker.hook)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-                filename = ydl.prepare_filename(info)
+                requested = info.get("requested_downloads")
+                if requested:
+                    filename = requested[0].get("filepath", ydl.prepare_filename(info))
+                else:
+                    filename = ydl.prepare_filename(info)
                 title = info.get("title", "Video")
                 duration = info.get("duration", 0)
                 is_video = info.get("is_video", True) or bool(info.get("duration"))
                 if not os.path.exists(filename):
                     base = os.path.splitext(filename)[0]
-                    for f in os.listdir(tempfile.gettempdir()):
-                        if f.startswith(os.path.basename(base)):
-                            filename = os.path.join(tempfile.gettempdir(), f)
+                    for ext in [".mp4", ".webm", ".mkv", ".jpg", ".png", ".webp"]:
+                        candidate = base + ext
+                        if os.path.exists(candidate):
+                            filename = candidate
                             break
                 return filename, title, duration, is_video, False
 
@@ -370,12 +389,14 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
                     duration=duration if duration else None,
                     supports_streaming=True,
+                    read_timeout=120,
                 )
         else:
             with open(filename, "rb") as f:
                 await update.message.reply_photo(
                     photo=f,
                     caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                    read_timeout=120,
                 )
 
         os.remove(filename)
