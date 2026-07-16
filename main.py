@@ -79,7 +79,9 @@ def get_ydl_opts(progress_hook=None):
         "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
         "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
-        "socket_timeout": 30,
+        "socket_timeout": 120,
+        "extractor_retries": 3,
+        "file_access_retries": 3,
         "quiet": True,
         "no_warnings": True,
     }
