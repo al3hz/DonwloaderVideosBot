@@ -41,6 +41,7 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 - `merge_output_format`: Always force `mp4` for standard Telegram client playback compatibility.
 - `cookies`: Optionally load from a file path defined in `COOKIES_FILE` environment variable, falling back to `tempfile/cookies.txt`.
 - `cachedir`: Always set to `YDL_CACHE_DIR` env var (or `<tempdir>/ydl_cache`). This enables yt-dlp's built-in extractor cache to avoid re-fetching info for repeated URLs.
+- `impersonate`: Always set to `""` (empty string). Enables TLS fingerprint impersonation (auto-select client) via `curl_cffi` when available, to bypass Cloudflare and other bot protections on sites like Reddit. Falls back gracefully if `curl_cffi` is not installed.
 
 ### Queue System
 

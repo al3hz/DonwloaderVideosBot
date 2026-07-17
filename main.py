@@ -27,7 +27,7 @@ PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
-ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com"]
+ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com", "reddit.com", "redd.it"]
 COOKIES_FILE = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
 MAX_URLS_PER_MESSAGE = int(os.environ.get("MAX_URLS_PER_MESSAGE", 20))
@@ -96,7 +96,8 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "• TikTok (sin marca de agua)\n"
         "• Instagram (Reels)\n"
         "• Facebook (videos / Reels)\n"
-        "• Twitter / X (Videos / GIF)\n\n"
+        "• Twitter / X (Videos / GIF)\n"
+        "• Reddit (videos)\n\n"
         "📦 **Cola por usuario:**\n"
         "Puedes enviar varios enlaces seguidos. Se procesarán en orden.\n\n"
         "⚠️ Límite: 50 MB por archivo."
@@ -151,6 +152,7 @@ def get_ydl_opts():
         "quiet": True,
         "no_warnings": True,
         "cachedir": CACHE_DIR,
+        "impersonate": "",  # auto-seleccionar impersonación si curl_cffi está disponible
     }
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
@@ -239,7 +241,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not valid_urls:
         await update.message.reply_text(
             "❌ No encontré enlaces válidos para descargar.\n"
-            "Acepto URLs de: TikTok, Instagram Reels, Facebook y Twitter/X."
+            "Acepto URLs de: TikTok, Instagram Reels, Facebook, Twitter/X y Reddit."
         )
         return
 
@@ -339,6 +341,10 @@ async def _queue_worker(user_id: int):
                 "may not be comfortable for some audiences": (
                     "❌ Este video fue marcado como **sensible** por TikTok.\n"
                     "No es posible descargarlo sin iniciar sesión."
+                ),
+                "Unexpected response from webpage request": (
+                    "❌ TikTok cambió algo en su sitio y el bot no puede descargar este video por ahora.\n"
+                    "Ya se reportó el problema. Probá de nuevo más tarde."
                 ),
             }
             display_msg = f"❌ Error de descarga:\n`{err_msg[:200]}`"
