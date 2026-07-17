@@ -40,6 +40,8 @@ application = (
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     """Mensaje de bienvenida con las plataformas soportadas."""
+    user = update.effective_user
+    logging.info(f"Comando /start de {user.id} (@{user.username})")
     text = (
         "👋 ¡Hola! Soy tu bot de descargas.\n\n"
         "📎 Envíame un enlace de:\n"
@@ -75,11 +77,12 @@ class ProgressTracker:
                             self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
                             self.loop,
                         )
-            except Exception:
-                pass
+            except Exception as e:
+                logging.warning(f"Error actualizando progreso: {e}")
 
     def close(self):
         """Marca el tracker como cerrado para evitar actualizaciones después de finalizar."""
+        logging.debug("ProgressTracker cerrado")
         with self._lock:
             self._closed = True
 
@@ -97,12 +100,14 @@ def get_ydl_opts(progress_hook=None):
     }
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
+        logging.info(f"Usando cookies desde {COOKIES_FILE}")
     if progress_hook:
         opts["progress_hooks"] = [progress_hook]
     return opts
 
 def _tiktok_api_fallback(url):
     """Fallback para TikTok slideshows usando la API de tikwm.com cuando yt-dlp falla."""
+    logging.info(f"Usando fallback tikwm.com para {url}")
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
@@ -110,12 +115,15 @@ def _tiktok_api_fallback(url):
     resp = requests.post("https://tikwm.com/api/", data={"url": url.split("?")[0]}, headers=headers, timeout=30)
     data = resp.json()
     if data.get("code") != 0:
+        logging.warning(f"tikwm.com respondió con código {data.get('code')}")
         return None
     result = data.get("data", {})
     images = result.get("images", [])
     music_url = result.get("music_info", {}).get("play", "")
     if not images:
+        logging.warning("tikwm.com no devolvió imágenes")
         return None
+    logging.info(f"tikwm.com devolvió {len(images)} imágenes")
     slideshow_formats = [{"url": img, "ext": "jpg"} for img in images]
     audio_formats = []
     if music_url:
@@ -131,6 +139,7 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     key = f"tiktok:{query.message.chat_id}:{query.message.message_id}"
     stored = context.user_data.pop(key, None)
     if not stored:
+        logging.warning(f"Callback expirado para {key}")
         await query.edit_message_text("❌ Esta solicitud ya expiró.")
         return
 
@@ -141,10 +150,12 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
+    logging.info(f"Descargando slide de TikTok para {query.message.chat_id}")
     await query.edit_message_text("⏳ Descargando imagen...")
     sf = stored["slideshow_format"]
     img_url = sf.get("url")
     if not img_url:
+        logging.error("No se encontró URL de imagen en slideshow_format")
         await query.edit_message_text("❌ No se pudo obtener la URL de la imagen.")
         return
     ext = sf.get("ext", "jpg")
@@ -168,14 +179,18 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Procesa un enlace enviado por el usuario: detecta plataforma, descarga y envía el video."""
     url = update.message.text.strip()
+    user = update.effective_user
+    logging.info(f"URL recibida de {user.id}: {url}")
 
     # Validación básica de URL
     if not url.startswith(("http://", "https://")):
+        logging.warning(f"URL inválida de {user.id}: {url}")
         await update.message.reply_text("❌ Envía un enlace válido.")
         return
 
     # Filtro por dominios permitidos
     if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
+        logging.warning(f"Dominio no permitido de {user.id}: {url}")
         await update.message.reply_text(
             "❌ Solo acepto enlaces de TikTok, Instagram y Twitter/X."
         )
@@ -183,6 +198,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Instagram: solo Reels, rechazar fotos estáticas /p/
     if "instagram.com/p/" in url:
+        logging.info(f"URL de foto IG rechazada: {url}")
         await update.message.reply_text(
             "❌ Solo acepto Reels de Instagram, no fotos estáticas."
         )
@@ -196,9 +212,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- Detección y manejo de TikTok slideshows (/photo/) ---
         if is_tiktok:
+            logging.info(f"URL de TikTok detectada: {url}")
             clean_url = url.split("?")[0]
             if "/photo/" in clean_url:
                 clean_url = clean_url.replace("/photo/", "/video/")
+                logging.info(f"URL convertida para slideshow: {clean_url}")
 
             # Intento 1: detectar slideshow via yt-dlp
             def try_ydl():
@@ -213,8 +231,9 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if slideshow_formats:
                     audio_formats = [f for f in formats if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"]
                     slideshow_data = (slideshow_formats, audio_formats, None)
-            except Exception:
-                pass
+                    logging.info(f"Slideshow detectado via yt-dlp: {len(slideshow_formats)} slides")
+            except Exception as e:
+                logging.warning(f"yt-dlp falló detectando slideshow: {e}")
 
             # Intento 2: fallback via API de tikwm.com si yt-dlp no detectó slideshow
             if not slideshow_data:
@@ -222,12 +241,13 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     api_data = await loop.run_in_executor(_download_executor, _tiktok_api_fallback, url)
                     if api_data:
                         slideshow_data = api_data
-                except Exception:
-                    pass
+                except Exception as e:
+                    logging.warning(f"Fallback tikwm también falló: {e}")
 
             # Si se detectó slideshow, descargar imágenes y enviar como álbum
             if slideshow_data:
                 slideshow_formats, audio_formats, api_images = slideshow_data
+                logging.info(f"Procesando slideshow con {len(slideshow_formats)} imágenes")
 
                 if len(slideshow_formats) == 1 and audio_formats:
                     pass  # Un solo slide con audio se maneja igual que múltiples
@@ -283,6 +303,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         # --- Descarga normal con yt-dlp (TikTok videos, Instagram Reels, Twitter/X) ---
+        logging.info(f"Iniciando descarga yt-dlp para: {url}")
         tracker = ProgressTracker(loop, processing_msg)
 
         # Función bloqueante que corre en el executor para no bloquear el event loop
@@ -311,9 +332,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = await loop.run_in_executor(_download_executor, download)
         filename, duration, is_video = result
         file_size = os.path.getsize(filename)
+        logging.info(f"Descarga completada: {filename} ({file_size} bytes)")
 
         # Verificar límite de 50 MB de Telegram
         if file_size > 50 * 1024 * 1024:
+            logging.warning(f"Archivo excede 50MB: {filename}")
             os.remove(filename)
             await processing_msg.edit_text(
                 "❌ El archivo pesa más de 50 MB.\n"
@@ -333,6 +356,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     supports_streaming=True,
                     read_timeout=120,
                 )
+            logging.info(f"Video enviado: {filename}")
         else:
             with open(filename, "rb") as f:
                 await update.message.reply_photo(
@@ -340,11 +364,13 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     caption=f"📥 Descargado por @{context.bot.username}",
                     read_timeout=120,
                 )
+            logging.info(f"Foto enviada: {filename}")
 
         os.remove(filename)
 
     except yt_dlp.utils.DownloadError as e:
         err_msg = str(e)
+        logging.error(f"DownloadError para {url}: {err_msg}")
         # Mapeo de errores conocidos a mensajes amigables en español
         friendly = {
             "No video could be found in this tweet": (
@@ -373,6 +399,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
     except Exception as e:
         msg = str(e)[:200]
+        logging.error(f"Error inesperado para {url}: {msg}")
         display_msg = f"❌ Error inesperado:\n`{msg}`"
         try:
             await processing_msg.edit_text(display_msg, parse_mode="Markdown")
@@ -382,6 +409,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     else:
+        logging.info(f"Descarga exitosa para: {url}")
         # Si todo salió bien, eliminar el mensaje de progreso
         await processing_msg.delete()
 
@@ -396,6 +424,7 @@ _bot_lock = threading.Lock()
 
 async def _init_bot():
     """Inicializa la aplicación de python-telegram-bot y configura el webhook si aplica."""
+    logging.info("Inicializando bot...")
     await application.initialize()
     await application.start()
     if RENDER_EXTERNAL_URL:
@@ -442,4 +471,5 @@ def health():
     return "OK", 200
 
 if __name__ == "__main__":
+    logging.info(f"Iniciando servidor en puerto {PORT}")
     app.run(host="0.0.0.0", port=PORT)

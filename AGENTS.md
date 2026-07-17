@@ -49,7 +49,8 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 - **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes or `yt-dlp` invocations) using `asyncio.to_thread()` or an executor.
 - **Conciseness:** Provide direct code updates. When modifying `main.py`, output the specific changed function or block rather than rewriting the entire file, unless explicitly requested.
-- **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish. Every integration, change, or new feature must be documented in this `AGENTS.md` to keep it in sync with the actual state of the project.
+- **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish. Every integration, change, or new feature must be documented in this `AGENTS.md` to keep it in sync with the actual state of the project. Each new functionality, feature, or flow change must be added here immediately after implementation.
+- **Logging Required:** Every function must include logs (`logging.info`, `logging.warning`, `logging.error`) to record its entry, key decisions, and errors. This allows tracking the bot's flow and diagnosing issues without debugging in production.
 
 ---
 
