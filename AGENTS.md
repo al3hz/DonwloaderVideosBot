@@ -17,7 +17,7 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 
 ## 🔄 Core Workflow & Logic
 
-1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, and Twitter/X patterns.
+1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, Facebook, and Twitter/X patterns.
 2. **Instagram Edge-case:** Strictly reject URLs containing `/p/` (photos/carousels) early to prevent redundant download triggers.
 3. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
 4. **Download Phase:** Initialize `yt-dlp` with a progress hook. Stream the output directly, handling network drops gracefully with retries.

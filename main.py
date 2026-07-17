@@ -22,7 +22,7 @@ PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 # Dominios permitidos para descarga
-ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com"]
+ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com"]
 
 # Archivo de cookies opcional para autenticación en plataformas
 COOKIES_FILE = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
@@ -47,6 +47,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "📎 Envíame un enlace de:\n"
         "• TikTok (sin marca de agua)\n"
         "• Instagram (Reels)\n"
+        "• Facebook (Reels)\n"
         "• Twitter / X\n\n"
         "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots)."
     )
