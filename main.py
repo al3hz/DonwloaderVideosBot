@@ -149,7 +149,7 @@ async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with open(filename, "rb") as f:
         await query.message.reply_photo(
             photo=f,
-            caption=f"📥 Descargado por @{stored['context'].bot.username}\n🔗 {url}",
+            caption=f"📥 Descargado por @{stored['context'].bot.username}",
         )
     os.remove(filename)
     try:
@@ -167,6 +167,12 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
         await update.message.reply_text(
             "❌ Solo acepto enlaces de TikTok, Instagram y Twitter/X."
+        )
+        return
+
+    if "instagram.com/p/" in url:
+        await update.message.reply_text(
+            "❌ Solo acepto Reels de Instagram, no fotos estáticas."
         )
         return
 
@@ -237,7 +243,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     return
 
                 await processing_msg.edit_text("📤 Subiendo a Telegram...")
-                caption_text = f"📥 Descargado por @{context.bot.username}\n🔗 {url}"
+                caption_text = f"📥 Descargado por @{context.bot.username}"
                 for batch_start in range(0, len(img_paths), 10):
                     batch = img_paths[batch_start:batch_start + 10]
                     media_group = []
@@ -302,7 +308,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(filename, "rb") as f:
                 await update.message.reply_video(
                     video=f,
-                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                    caption=f"📥 Descargado por @{context.bot.username}",
                     duration=duration if duration else None,
                     supports_streaming=True,
                     read_timeout=120,
@@ -311,7 +317,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             with open(filename, "rb") as f:
                 await update.message.reply_photo(
                     photo=f,
-                    caption=f"📥 Descargado por @{context.bot.username}\n🔗 {url}",
+                    caption=f"📥 Descargado por @{context.bot.username}",
                     read_timeout=120,
                 )
 
@@ -322,8 +328,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         friendly = {
             "No video could be found in this tweet": (
                 "❌ No se pudo encontrar un video en ese tweet.\n"
-                "Asegúrate de que el tweet contiene un video nativo (no un enlace externo).\n"
-                "Si el problema persiste, prueba desde la cuenta oficial @botfather."
+                "Asegúrate de que el tweet contiene un video nativo de X (no un enlace externo)."
             ),
             "Requested format is not available": (
                 "❌ No hay un formato de video disponible para este enlace."
@@ -341,21 +346,20 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             await processing_msg.edit_text(display_msg, parse_mode="Markdown")
         except Exception:
-            pass
-        try:
-            await update.message.reply_text(display_msg, parse_mode="Markdown")
-        except Exception:
-            pass
+            try:
+                await update.message.reply_text(display_msg, parse_mode="Markdown")
+            except Exception:
+                pass
     except Exception as e:
         msg = str(e)[:200]
+        display_msg = f"❌ Error inesperado:\n`{msg}`"
         try:
-            await processing_msg.edit_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
+            await processing_msg.edit_text(display_msg, parse_mode="Markdown")
         except Exception:
-            pass
-        try:
-            await update.message.reply_text(f"❌ Error inesperado:\n`{msg}`", parse_mode="Markdown")
-        except Exception:
-            pass
+            try:
+                await update.message.reply_text(display_msg, parse_mode="Markdown")
+            except Exception:
+                pass
     else:
         await processing_msg.delete()
 
