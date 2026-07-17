@@ -144,7 +144,7 @@ def get_ydl_opts():
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     opts = {
-        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
+        "format": "bestvideo[filesize<50M]+bestaudio/best[filesize<50M]/bestvideo+bestaudio/best",
         "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
         "merge_output_format": "mp4",
         "socket_timeout": 120,
@@ -204,41 +204,84 @@ def _tiktok_api_fallback(url):
 def _reddit_image_fallback(url):
     """
     Fallback para posts de Reddit que contienen imágenes o GIFs en lugar de videos.
-    Usa yt-dlp con process=False para obtener la URL directa del recurso.
+    1. Limpia la URL (quita parámetros share que interfieren)
+    2. Usa yt-dlp con process=False para obtener la URL directa del recurso
+    3. Descarga la imagen/GIF y la guarda con la extensión correcta
     """
     logging.info(f"Usando fallback de imagen Reddit para {url}")
     try:
+        # Limpiar URL: eliminar query params y resolver /s/ -> /comments/
+        clean_url = url.split("?")[0]
+        # Si es /s/, intentar resolver la redirección para obtener /comments/
+        if "/s/" in clean_url:
+            try:
+                head = requests.head(clean_url, allow_redirects=True, timeout=15,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                if head.url and "/comments/" in head.url:
+                    clean_url = head.url.split("?")[0]
+                    logging.info(f"Reddit fallback: /s/ resuelto a {clean_url}")
+            except Exception:
+                pass
+
         # Extraer info sin procesar la URL incrustada
         with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "socket_timeout": 20, "impersonate": ""}) as ydl:
-            info = ydl.extract_info(url, download=False, process=False)
-            image_url = info.get("url")
-            if not image_url:
+            info = ydl.extract_info(clean_url, download=False, process=False)
+            media_url = info.get("url")
+            if not media_url:
                 logging.warning("Reddit fallback: no se encontró URL en la info extraída")
                 return None
 
-            # Determinar extensión
-            path = urlparse(image_url).path
-            ext = path.split(".")[-1].lower() if "." in path else "jpg"
+            # La URL puede ser del post (debe redirigir a i.redd.it) o directa a i.redd.it
+            # Seguir redirecciones hasta obtener la URL directa del archivo
+            try:
+                head = requests.head(media_url, allow_redirects=True, timeout=15,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                final_url = head.url
+            except Exception:
+                final_url = media_url
+
+            # Determinar extensión real desde Content-Type o desde la URL final
+            ext = "jpg"  # default
+            try:
+                resp = requests.head(final_url, timeout=15,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                ct = resp.headers.get("Content-Type", "")
+                if "gif" in ct:
+                    ext = "gif"
+                elif "png" in ct:
+                    ext = "png"
+                elif "jpeg" in ct or "jpg" in ct:
+                    ext = "jpg"
+                elif "webp" in ct:
+                    ext = "webp"
+                else:
+                    # Fallback a extensión de la URL
+                    path = urlparse(final_url).path
+                    ext = path.split(".")[-1].lower() if "." in path else "jpg"
+            except Exception:
+                path = urlparse(final_url).path
+                ext = path.split(".")[-1].lower() if "." in path else "jpg"
+
             if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
                 logging.warning(f"Reddit fallback: extensión no soportada {ext}")
                 return None
 
-            logging.info(f"Reddit fallback: descargando {image_url}")
+            logging.info(f"Reddit fallback: descargando {final_url} (ext={ext})")
             headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             }
-            r = requests.get(image_url, headers=headers, timeout=60)
+            r = requests.get(final_url, headers=headers, timeout=60)
             r.raise_for_status()
 
+            post_id = info.get("id") or str(int(time.time()))
             filename = os.path.join(
                 tempfile.gettempdir(),
-                f"reddit_img_{int(time.time())}_{info.get('id', 'unknown')}.{ext}",
+                f"reddit_img_{post_id}.{ext}",
             )
             with open(filename, "wb") as f:
                 f.write(r.content)
 
-            logging.info(f"Reddit fallback: imagen descargada en {filename}")
+            logging.info(f"Reddit fallback: imagen descargada en {filename} ({len(r.content)} bytes)")
             return filename
 
     except Exception as e:
@@ -447,6 +490,20 @@ async def _execute_download(task: DownloadTask):
     url = task.url
     bot = application.bot
     is_tiktok = "tiktok.com" in url
+
+    # Limpiar URL de Reddit: eliminar parámetros share que interfieren con yt-dlp
+    if any(d in url for d in ["reddit.com", "redd.it"]):
+        url = url.split("?")[0]
+        # Si es /s/, resolver la redirección a /comments/
+        if "/s/" in url:
+            try:
+                head = requests.head(url, allow_redirects=True, timeout=15,
+                                     headers={"User-Agent": "Mozilla/5.0"})
+                if head.url and "/comments/" in head.url:
+                    url = head.url.split("?")[0]
+                    logging.info(f"URL de Reddit resuelta: {url}")
+            except Exception:
+                pass
 
     # Si no hay mensaje de progreso (múltiples URLs), crear uno ahora
     if task.processing_msg_id is None:
