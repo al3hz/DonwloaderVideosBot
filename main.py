@@ -22,7 +22,7 @@ PORT = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 
 # Dominios permitidos para descarga
-ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com"]
+ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com", "youtube.com", "youtu.be"]
 
 # Archivo de cookies opcional para autenticación en plataformas
 COOKIES_FILE = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
@@ -48,8 +48,11 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "• TikTok (sin marca de agua)\n"
         "• Instagram (Reels)\n"
         "• Facebook (videos / Reels)\n"
-        "• Twitter / X (Videos / GIF)\n\n"
-        "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots)."
+        "• Twitter / X (Videos / GIF)\n"
+        "• YouTube (videos públicos / Shorts)\n\n"
+        "⚠️ Límite: 50 MB por archivo.\n"
+        "⚠️ YouTube: solo videos públicos. No funcionan videos privados, "
+        "con restricción de edad ni livestreams."
     )
     await update.message.reply_text(text)
 
@@ -169,7 +172,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
         logging.warning(f"Dominio no permitido de {user.id}: {url}")
         await update.message.reply_text(
-            "❌ Solo acepto enlaces de TikTok, Instagram, Facebook y Twitter/X."
+            "❌ Solo acepto enlaces de TikTok, Instagram, Facebook, Twitter/X y YouTube."
         )
         return
 
