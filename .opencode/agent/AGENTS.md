@@ -12,6 +12,7 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 - **Web Server:** `Flask` (webhook handler) running under `Gunicorn` (1 worker, 8 threads).
 - **Deployment:** Render (configured via `Procfile`, `requirements.txt`, and `runtime.txt`).
 - **File Structure:** Single-file monolithic script (`main.py`) for clean, self-contained deployment.
+- **Admin Commands:** `/stats` for admins (configured via `ADMIN_IDS` env var).
 
 ---
 
@@ -19,10 +20,12 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 
 1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, Facebook, and Twitter/X patterns.
 2. **Instagram Edge-case:** Strictly reject URLs containing `/p/` (photos/carousels) early to prevent redundant download triggers.
-3. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
-4. **Download Phase:** Initialize `yt-dlp`. Stream the output directly, handling network drops gracefully with retries. No progress is shown to the user — only a static ⏳ emoji.
-5. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `reply_animation` (GIF) instead of `reply_video`.
-6. **Garbage Collection:** Always clean up temporary files in a `finally` block or an `async` context manager, even if the upload fails.
+3. **Queue System (FIFO per user):** Each URL received is validated and then enqueued into a per-user `asyncio.Queue`. A dedicated background worker (`_queue_worker`) processes tasks in order. Workers auto-terminate after 5 minutes of inactivity.
+4. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
+5. **Download Phase:** Initialize `yt-dlp`. The output is written to a temp file in `tempfile.gettempdir()`. No progress is shown to the user — only a static ⏳ emoji.
+6. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context.
+7. **Garbage Collection:** Always clean up temporary files, even if the upload fails.
+8. **Metrics:** Track total requests, successful downloads, failed downloads, and unique users in a thread-safe global dict (`_stats` with `_stats_lock`).
 
 ---
 
@@ -37,22 +40,48 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 - `file_access_retries`: `3` attempts.
 - `merge_output_format`: Always force `mp4` for standard Telegram client playback compatibility.
 - `cookies`: Optionally load from a file path defined in `COOKIES_FILE` environment variable, falling back to `tempfile/cookies.txt`.
+- `cachedir`: Always set to `YDL_CACHE_DIR` env var (or `<tempdir>/ydl_cache`). This enables yt-dlp's built-in extractor cache to avoid re-fetching info for repeated URLs.
+
+### Queue System
+
+- **Per-user FIFO queue:** Each user has their own `asyncio.Queue[DownloadTask]`. Workers are created on-demand and auto-terminate after 5 minutes of inactivity.
+- **Executor:** A shared `ThreadPoolExecutor(max_workers=2)` handles yt-dlp operations across all queues.
+- **Error isolation:** Errors in `_execute_download` are caught by the worker and reported to the user via the processing message, without crashing the worker.
+
+### Metrics & Admin
+
+- **`/stats` command:** Accessible only to user IDs listed in `ADMIN_IDS` env var (comma-separated). Shows uptime, total requests, successes, failures, unique users, and active queues.
+- **Global stats dict (`_stats`):** Thread-safe (`_stats_lock`). Tracks `start_time`, `total_requests`, `successful`, `failed`, `unique_users`.
+- **Health endpoint (`/health`):** Returns JSON with `status`, `yt_dlp_version`, `bot_ready`, and `queues` info (active queues + workers). Useful for Render monitoring.
 
 ### UX & Error Handling
 
-- **State management:** Use a single "⏳" status message. Always **edit** this message only to show failure. Never edit it to show download progress. Never send duplicate/spammy error messages.
+- **State management:** Use a single "⏳" status message. Show "⏳ En cola..." initially, then edit to "⏳" when processing starts. Always **edit** this message to show failure. Never edit it to show download progress. Never send duplicate/spammy error messages.
 - **Error translations:** Catch known `yt-dlp` exceptions (e.g., Geo-restriction, private video, deleted content) and map them to friendly, localized Spanish errors instead of throwing raw stack traces to the user.
-- **Start message sync:** Whenever a new platform or feature is added (e.g., GIF support, a new domain), the `/start` command text must be updated to reflect it. This ensures users always see an accurate list of supported platforms and capabilities.
+- **Start message sync:** Whenever a new platform or feature is added (e.g., GIF support, a new domain, queue system), the `/start` command text must be updated to reflect it. This ensures users always see an accurate list of supported platforms and capabilities.
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `TELEGRAM_TOKEN` | ✅ | — | Bot token de Telegram |
+| `RENDER_EXTERNAL_HOSTNAME` | ❌ | — | URL externa de Render (para webhook) |
+| `ADMIN_IDS` | ❌ | — | IDs de Telegram separados por coma para `/stats` |
+| `COOKIES_FILE` | ❌ | `<tempdir>/cookies.txt` | Ruta al archivo de cookies |
+| `YDL_CACHE_DIR` | ❌ | `<tempdir>/ydl_cache` | Directorio para caché de extractores de yt-dlp |
+| `PORT` | ❌ | `8080` | Puerto del servidor Flask |
 
 ---
 
 ## 💻 Coding Standards (For the AI Agent)
 
-- **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes or `yt-dlp` invocations) using `asyncio.to_thread()` or an executor.
+- **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes or `yt-dlp` invocations) using `loop.run_in_executor()` with `_download_executor`.
 - **Conciseness:** Provide direct code updates. When modifying `main.py`, output the specific changed function or block rather than rewriting the entire file, unless explicitly requested.
 - **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish.
 - **Sync AGENTS.md on every change:** Every integration, change, new feature, or flow modification **must** be documented immediately in this `AGENTS.md`. This file must always reflect the exact current state of the project. No functionality change is complete until `AGENTS.md` is updated accordingly.
 - **Logging Required:** Every function must include logs (`logging.info`, `logging.warning`, `logging.error`) to record its entry, key decisions, and errors. This allows tracking the bot's flow and diagnosing issues without debugging in production.
+- **Thread safety:** Global mutable state (`_stats`, `_user_queues`, `_queue_workers`) must be protected. Use `threading.Lock` for dict/set mutations accessed from multiple threads.
+- **Download handler pattern:** `download_video` is a thin handler that validates + enqueues. The actual download logic lives in `_execute_download`. Errors in `_execute_download` are caught by `_queue_worker` which handles user-friendly error messages and metric tracking.
 
 ---
 
