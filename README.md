@@ -9,6 +9,7 @@ Envía un enlace al bot y este te devolverá el video descargado.
 **Plataformas soportadas:**
 - TikTok (videos y slideshows)
 - Instagram (solo Reels)
+- Facebook (videos / Reels)
 - Twitter / X
 
 **Límite:** 50 MB por archivo (límite de Telegram para bots).
@@ -29,10 +30,10 @@ Envía un enlace al bot y este te devolverá el video descargado.
 | `Procfile` | Comando de inicio para Render |
 | `requirements.txt` | Dependencias |
 | `runtime.txt` | Versión de Python |
-| `AGENTS.md` | Instrucciones para IA |
+| `.opencode/agent/AGENTS.md` | Instrucciones para IA |
 
 ## AGENTS.md
 
-Este proyecto incluye un archivo `AGENTS.md` con instrucciones detalladas para que una IA (como opencode o Claude) pueda entender, mantener y mejorar el código correctamente. Incluye el stack, flujo de trabajo, reglas de configuración, estándares de código y un protocolo de verificación.
+Este proyecto incluye un archivo `.opencode/agent/AGENTS.md` con instrucciones detalladas para que una IA (como opencode o Claude) pueda entender, mantener y mejorar el código correctamente. Incluye el stack, flujo de trabajo, reglas de configuración, estándares de código y un protocolo de verificación.
 
-Si usas una IA para trabajar en este proyecto, asígnala a `AGENTS.md` primero.
+Si usas una IA para trabajar en este proyecto, asígnala a `.opencode/agent/AGENTS.md` primero.

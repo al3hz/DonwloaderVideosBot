@@ -47,7 +47,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "📎 Envíame un enlace de:\n"
         "• TikTok (sin marca de agua)\n"
         "• Instagram (Reels)\n"
-        "• Facebook (Reels)\n"
+        "• Facebook (videos / Reels)\n"
         "• Twitter / X (Videos / GIF)\n\n"
         "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots)."
     )
@@ -194,7 +194,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
         logging.warning(f"Dominio no permitido de {user.id}: {url}")
         await update.message.reply_text(
-            "❌ Solo acepto enlaces de TikTok, Instagram y Twitter/X."
+            "❌ Solo acepto enlaces de TikTok, Instagram, Facebook y Twitter/X."
         )
         return
 
