@@ -199,64 +199,85 @@ def _tiktok_api_fallback(url):
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Valida la URL enviada por el usuario y la encola para procesarla.
-    Si el usuario ya tiene descargas en cola, se procesarán en orden FIFO.
+    Valida la(s) URL(s) enviada(s) por el usuario y las encola para procesarlas.
+    Soporta múltiples URLs en un solo mensaje (una por línea).
+    Se procesarán en orden FIFO por usuario.
     """
-    url = update.message.text.strip()
+    raw_text = update.message.text.strip()
     user = update.effective_user
     chat_id = update.effective_chat.id
-    logging.info(f"URL recibida de {user.id}: {url}")
 
-    # Validación básica de URL
-    if not url.startswith(("http://", "https://")):
-        logging.warning(f"URL inválida de {user.id}: {url}")
-        await update.message.reply_text("❌ Envía un enlace válido.")
-        return
+    # Separar por saltos de línea o espacios, filtrar líneas vacías
+    candidate_urls = [line.strip() for line in raw_text.replace("\r\n", "\n").split("\n") if line.strip()]
+    logging.info(f"{len(candidate_urls)} URL(s) recibida(s) de {user.id}")
 
-    # Filtro por dominios permitidos
-    if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
-        logging.warning(f"Dominio no permitido de {user.id}: {url}")
+    # Validar cada URL y quedarse solo con las válidas
+    valid_urls = []
+    for url in candidate_urls:
+        if not url.startswith(("http://", "https://")):
+            logging.warning(f"URL inválida de {user.id}: {url}")
+            continue
+        if not any(domain in url.lower() for domain in ALLOWED_DOMAINS):
+            logging.warning(f"Dominio no permitido de {user.id}: {url}")
+            continue
+        if "instagram.com/p/" in url:
+            logging.info(f"URL de foto IG rechazada: {url}")
+            continue
+        valid_urls.append(url)
+
+    if not valid_urls:
         await update.message.reply_text(
-            "❌ Solo acepto enlaces de TikTok, Instagram, Facebook y Twitter/X."
+            "❌ No encontré enlaces válidos para descargar.\n"
+            "Acepto URLs de: TikTok, Instagram Reels, Facebook y Twitter/X."
         )
         return
 
-    # Instagram: solo Reels, rechazar fotos estáticas /p/
-    if "instagram.com/p/" in url:
-        logging.info(f"URL de foto IG rechazada: {url}")
-        await update.message.reply_text(
-            "❌ Solo acepto Reels de Instagram, no fotos estáticas."
-        )
-        return
-
-    processing_msg = await update.message.reply_text("⏳ En cola...")
-
-    # Registrar métricas
-    _inc_stats("total_requests")
+    # Registrar métricas del usuario
+    for _ in valid_urls:
+        _inc_stats("total_requests")
     _add_unique_user(user.id)
-
-    # Crear tarea de descarga
-    task = DownloadTask(
-        url=url,
-        chat_id=chat_id,
-        user_id=user.id,
-        message_id=update.message.message_id,
-        bot_username=context.bot.username,
-        processing_msg_id=processing_msg.message_id,
-    )
 
     # Obtener o crear cola para este usuario
     if user.id not in _user_queues:
         _user_queues[user.id] = asyncio.Queue()
 
-    await _user_queues[user.id].put(task)
+    # Avisar y encolar según cantidad de URLs
+    if len(valid_urls) == 1:
+        url = valid_urls[0]
+        processing_msg = await update.message.reply_text("⏳ En cola...")
+        task = DownloadTask(
+            url=url,
+            chat_id=chat_id,
+            user_id=user.id,
+            message_id=update.message.message_id,
+            bot_username=context.bot.username,
+            processing_msg_id=processing_msg.message_id,
+        )
+        await _user_queues[user.id].put(task)
+    else:
+        await update.message.reply_text(
+            f"⏳ **{len(valid_urls)} enlaces encolados.**\n"
+            "Se procesarán uno por uno en orden.",
+            parse_mode="Markdown",
+        )
+        for url in valid_urls:
+            # Múltiples URLs: sin mensaje individual, el worker asignará uno al empezar
+            task = DownloadTask(
+                url=url,
+                chat_id=chat_id,
+                user_id=user.id,
+                message_id=update.message.message_id,
+                bot_username=context.bot.username,
+                processing_msg_id=None,
+            )
+            await _user_queues[user.id].put(task)
 
     # Iniciar worker si no hay uno corriendo para este usuario
     if user.id not in _queue_workers or _queue_workers[user.id].done():
         _queue_workers[user.id] = asyncio.create_task(_queue_worker(user.id))
         logging.info(f"Worker iniciado para usuario {user.id}")
 
-    logging.info(f"Tarea encolada para {user.id}: {url[:80]}...")
+    logging.info(f"{len(valid_urls)} tarea(s) encolada(s) para {user.id}")
 
 # ============================================================
 # Worker de cola por usuario
@@ -352,12 +373,27 @@ async def _execute_download(task: DownloadTask):
     bot = application.bot
     is_tiktok = "tiktok.com" in url
 
-    # Actualizar mensaje de cola a procesando
-    await bot.edit_message_text(
-        chat_id=task.chat_id,
-        message_id=task.processing_msg_id,
-        text="⏳",
-    )
+    # Si no hay mensaje de progreso (múltiples URLs), crear uno ahora
+    if task.processing_msg_id is None:
+        try:
+            msg = await bot.send_message(
+                chat_id=task.chat_id,
+                text="⏳",
+                reply_to_message_id=task.message_id,
+            )
+            task.processing_msg_id = msg.message_id
+        except Exception:
+            pass
+    else:
+        # Actualizar mensaje de cola a procesando
+        try:
+            await bot.edit_message_text(
+                chat_id=task.chat_id,
+                message_id=task.processing_msg_id,
+                text="⏳",
+            )
+        except Exception:
+            pass
 
     loop = asyncio.get_running_loop()
 
