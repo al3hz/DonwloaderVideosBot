@@ -188,7 +188,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    processing_msg = await update.message.reply_text("⏳ Analizando enlace...")
+    processing_msg = await update.message.reply_text("⏳")
 
     try:
         loop = asyncio.get_running_loop()
@@ -382,7 +382,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
     else:
-        # Si todo salió bien, eliminar el mensaje de "Analizando enlace..."
+        # Si todo salió bien, eliminar el mensaje de progreso
         await processing_msg.delete()
 
 application.add_handler(CommandHandler("start", start))
