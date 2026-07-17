@@ -1,6 +1,6 @@
 # DownloaderVideosBot
 
-Bot de Telegram para descargar videos de **TikTok**, **Instagram Reels**, **Facebook**, **Twitter/X** y **YouTube**.
+Bot de Telegram para descargar videos de **TikTok**, **Instagram Reels**, **Facebook** y **Twitter/X**.
 
 ## Cómo usar
 
@@ -11,7 +11,6 @@ Envía un enlace al bot y este te devolverá el video descargado.
 - Instagram (solo Reels)
 - Facebook (videos / Reels)
 - Twitter / X
-- YouTube (videos públicos / Shorts; no privados ni restringidos)
 
 **Límite:** 50 MB por archivo (límite de Telegram para bots).
 

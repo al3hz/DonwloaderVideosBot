@@ -17,11 +17,11 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 
 ## 🔄 Core Workflow & Logic
 
-1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, Facebook, Twitter/X, and YouTube patterns.
+1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, Facebook, and Twitter/X patterns.
 2. **Instagram Edge-case:** Strictly reject URLs containing `/p/` (photos/carousels) early to prevent redundant download triggers.
 3. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
-4. **Download Phase:** Initialize `yt-dlp` with a progress hook. Stream the output directly, handling network drops gracefully with retries.
-5. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `reply_animation` (GIF) instead of `reply_video`.
+4. **Download Phase:** Initialize `yt-dlp`. Stream the output directly, handling network drops gracefully with retries. No progress is shown to the user — only a static ⏳ emoji.
+5. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `reply_animation` (GIF) instead of `reply_video`.
 6. **Garbage Collection:** Always clean up temporary files in a `finally` block or an `async` context manager, even if the upload fails.
 
 ---
@@ -40,7 +40,7 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 ### UX & Error Handling
 
-- **State management:** Use a single "Processing..." status message. Always **edit** this message to show progress or report failure. Never send duplicate/spammy error messages.
+- **State management:** Use a single "⏳" status message. Always **edit** this message only to show failure. Never edit it to show download progress. Never send duplicate/spammy error messages.
 - **Error translations:** Catch known `yt-dlp` exceptions (e.g., Geo-restriction, private video, deleted content) and map them to friendly, localized Spanish errors instead of throwing raw stack traces to the user.
 - **Start message sync:** Whenever a new platform or feature is added (e.g., GIF support, a new domain), the `/start` command text must be updated to reflect it. This ensures users always see an accurate list of supported platforms and capabilities.
 
@@ -50,7 +50,8 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 - **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes or `yt-dlp` invocations) using `asyncio.to_thread()` or an executor.
 - **Conciseness:** Provide direct code updates. When modifying `main.py`, output the specific changed function or block rather than rewriting the entire file, unless explicitly requested.
-- **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish. Every integration, change, or new feature must be documented in this `AGENTS.md` to keep it in sync with the actual state of the project. Each new functionality, feature, or flow change must be added here immediately after implementation.
+- **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish.
+- **Sync AGENTS.md on every change:** Every integration, change, new feature, or flow modification **must** be documented immediately in this `AGENTS.md`. This file must always reflect the exact current state of the project. No functionality change is complete until `AGENTS.md` is updated accordingly.
 - **Logging Required:** Every function must include logs (`logging.info`, `logging.warning`, `logging.error`) to record its entry, key decisions, and errors. This allows tracking the bot's flow and diagnosing issues without debugging in production.
 
 ---
@@ -82,3 +83,13 @@ When the user reports an issue with a specific URL:
 
 ### 4. Verify Before Deploying
 After any code change, run a final syntax and import check before telling the user the fix is ready.
+
+### 5. Render Compatibility Check
+Before deploying any new feature or platform integration to production, verify that it will work in Render's environment:
+- **Datacenter IP:** Render uses datacenter IPs. Some platforms (like YouTube) block these IPs. Do not add a platform if it requires a residential IP or cookies to function.
+- **Disk space:** Render has an ephemeral filesystem. Make sure to use `tempfile.gettempdir()` for temporary files (already implemented).
+- **Gunicorn timeout:** The `Procfile` has `--timeout 300`. Any operation exceeding this time must run in the background.
+- **Cookies:** If a platform mandatorily requires cookies on Render, document it in the `/start` command as a known limitation before adding it.
+- **Test simulating Render:** If possible, test the URL with yt-dlp from a VPS or cloud server (not just from a residential IP) to confirm it works.
+
+Do not approve a new feature if it does not pass this Render verification.
