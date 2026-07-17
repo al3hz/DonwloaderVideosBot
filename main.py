@@ -54,39 +54,14 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 class ProgressTracker:
-    """Rastrea el progreso de descarga de yt-dlp y actualiza el mensaje de Telegram."""
+    """Rastrea el progreso de descarga de yt-dlp (callback interno)."""
 
-    def __init__(self, loop, message):
+    def __init__(self):
         logging.debug("ProgressTracker inicializado")
-        self.loop = loop
-        self.message = message
-        self.last_pct = -1
-        self._closed = False
-        self._lock = threading.Lock()
 
     def hook(self, d):
-        """Callback de yt-dlp que se ejecuta en cada actualización de progreso."""
-        if d["status"] == "downloading":
-            try:
-                raw = d.get("_percent_str", "").strip().replace("%", "")
-                pct = float(raw)
-                if pct - self.last_pct >= 5 or (pct == 100 and self.last_pct != 100):
-                    self.last_pct = pct
-                    with self._lock:
-                        closed = self._closed
-                    if not closed and self.loop and not self.loop.is_closed():
-                        asyncio.run_coroutine_threadsafe(
-                            self.message.edit_text(f"⏳ Descargando... {pct:.0f}%"),
-                            self.loop,
-                        )
-            except Exception as e:
-                logging.warning(f"Error actualizando progreso: {e}")
-
-    def close(self):
-        """Marca el tracker como cerrado para evitar actualizaciones después de finalizar."""
-        logging.debug("ProgressTracker cerrado")
-        with self._lock:
-            self._closed = True
+        """Callback de yt-dlp (no se muestra progreso al usuario, solo ⏳)."""
+        pass
 
 def get_ydl_opts(progress_hook=None):
     """Retorna las opciones de configuración para yt-dlp con los parámetros del proyecto."""
@@ -255,8 +230,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if len(slideshow_formats) == 1 and audio_formats:
                     pass  # Un solo slide con audio se maneja igual que múltiples
 
-                await processing_msg.edit_text("⏳ Descargando imágenes...")
-
                 # Descarga todas las imágenes del slideshow
                 def dl_slideshow():
                     logging.debug("dl_slideshow: descargando imagenes")
@@ -282,7 +255,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await processing_msg.edit_text("❌ No se pudieron descargar las imágenes.")
                     return
 
-                await processing_msg.edit_text("📤 Subiendo a Telegram...")
                 caption_text = f"📥 Descargado por @{context.bot.username}"
                 for batch_start in range(0, len(img_paths), 10):
                     batch = img_paths[batch_start:batch_start + 10]
@@ -308,12 +280,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # --- Descarga normal con yt-dlp (TikTok videos, Instagram Reels, Twitter/X) ---
         logging.info(f"Iniciando descarga yt-dlp para: {url}")
-        tracker = ProgressTracker(loop, processing_msg)
 
         # Función bloqueante que corre en el executor para no bloquear el event loop
         def download():
             logging.debug("download: iniciando yt-dlp")
-            opts = get_ydl_opts(tracker.hook)
+            opts = get_ydl_opts()
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 # Obtener la ruta real del archivo descargado
@@ -349,8 +320,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        await processing_msg.edit_text("📤 Subiendo a Telegram...")
-
         # Detectar si el archivo tiene audio (si no, se envía como GIF animado)
         import subprocess
         try:
@@ -369,6 +338,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     animation=f,
                     caption=f"📥 Descargado por @{context.bot.username}",
                     read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
                 )
             logging.info(f"GIF enviado: {filename}")
         elif is_video:
@@ -379,6 +350,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     duration=duration if duration else None,
                     supports_streaming=True,
                     read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
                 )
             logging.info(f"Video enviado: {filename}")
         else:
@@ -387,6 +360,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     photo=f,
                     caption=f"📥 Descargado por @{context.bot.username}",
                     read_timeout=120,
+                    write_timeout=120,
+                    connect_timeout=30,
                 )
             logging.info(f"Foto enviada: {filename}")
 
