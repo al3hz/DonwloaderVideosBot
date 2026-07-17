@@ -7,6 +7,7 @@ import logging
 import concurrent.futures
 import subprocess
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify
 from telegram import Update, InputMediaPhoto
@@ -197,6 +198,55 @@ def _tiktok_api_fallback(url):
     return (slideshow_formats, audio_formats, images)
 
 # ============================================================
+# Fallback para Reddit: descarga directa de imágenes/GIFs
+# ============================================================
+
+def _reddit_image_fallback(url):
+    """
+    Fallback para posts de Reddit que contienen imágenes o GIFs en lugar de videos.
+    Usa yt-dlp con process=False para obtener la URL directa del recurso.
+    """
+    logging.info(f"Usando fallback de imagen Reddit para {url}")
+    try:
+        # Extraer info sin procesar la URL incrustada
+        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "socket_timeout": 20, "impersonate": ""}) as ydl:
+            info = ydl.extract_info(url, download=False, process=False)
+            image_url = info.get("url")
+            if not image_url:
+                logging.warning("Reddit fallback: no se encontró URL en la info extraída")
+                return None
+
+            # Determinar extensión
+            path = urlparse(image_url).path
+            ext = path.split(".")[-1].lower() if "." in path else "jpg"
+            if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
+                logging.warning(f"Reddit fallback: extensión no soportada {ext}")
+                return None
+
+            logging.info(f"Reddit fallback: descargando {image_url}")
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            }
+            r = requests.get(image_url, headers=headers, timeout=60)
+            r.raise_for_status()
+
+            filename = os.path.join(
+                tempfile.gettempdir(),
+                f"reddit_img_{int(time.time())}_{info.get('id', 'unknown')}.{ext}",
+            )
+            with open(filename, "wb") as f:
+                f.write(r.content)
+
+            logging.info(f"Reddit fallback: imagen descargada en {filename}")
+            return filename
+
+    except Exception as e:
+        logging.warning(f"Reddit fallback: error {e}")
+        return None
+
+
+# ============================================================
 # Handler principal: recibe URLs y las encola
 # ============================================================
 
@@ -345,6 +395,10 @@ async def _queue_worker(user_id: int):
                 "Unexpected response from webpage request": (
                     "❌ TikTok cambió algo en su sitio y el bot no puede descargar este video por ahora.\n"
                     "Ya se reportó el problema. Probá de nuevo más tarde."
+                ),
+                "Unsupported URL": (
+                    "❌ Ese enlace de Reddit no contiene un video.\n"
+                    "Solo puedo descargar posts de Reddit que tengan videos (v.redd.it)."
                 ),
             }
             display_msg = f"❌ Error de descarga:\n`{err_msg[:200]}`"
@@ -543,7 +597,7 @@ async def _execute_download(task: DownloadTask):
             return
 
     # ================================================================
-    # Descarga normal con yt-dlp (videos TikTok, Instagram Reels, Twitter/X, Facebook)
+    # Descarga normal con yt-dlp (videos TikTok, Instagram Reels, Twitter/X, Facebook, Reddit)
     # ================================================================
     logging.info(f"Iniciando descarga yt-dlp para: {url}")
 
@@ -570,6 +624,50 @@ async def _execute_download(task: DownloadTask):
                         filename = candidate
                         break
             return filename, duration, is_video
+
+    is_reddit = any(d in url for d in ["reddit.com", "redd.it"])
+
+    # Para Reddit: intentar descarga normal, si falla probar fallback para imágenes/GIFs
+    if is_reddit:
+        try:
+            result = await loop.run_in_executor(_download_executor, download)
+        except Exception as e:
+            logging.info(f"Reddit: descarga normal falló, probando fallback de imagen: {e}")
+            img_filename = await loop.run_in_executor(_download_executor, _reddit_image_fallback, url)
+            if img_filename:
+                file_size = os.path.getsize(img_filename)
+                if file_size > 50 * 1024 * 1024:
+                    os.remove(img_filename)
+                    await bot.edit_message_text(
+                        chat_id=task.chat_id, message_id=task.processing_msg_id,
+                        text="❌ El archivo pesa más de 50 MB."
+                    )
+                    _inc_stats("failed")
+                    return
+                # Enviar como foto o GIF según extensión
+                ext = os.path.splitext(img_filename)[1].lower()
+                caption = f"📥 Descargado por @{task.bot_username}"
+                if ext == ".gif":
+                    with open(img_filename, "rb") as f:
+                        await bot.send_animation(
+                            chat_id=task.chat_id, animation=f, caption=caption,
+                            read_timeout=120, write_timeout=120, connect_timeout=30,
+                        )
+                else:
+                    with open(img_filename, "rb") as f:
+                        await bot.send_photo(
+                            chat_id=task.chat_id, photo=f, caption=caption,
+                            read_timeout=120, write_timeout=120, connect_timeout=30,
+                        )
+                os.remove(img_filename)
+                _inc_stats("successful")
+                try:
+                    await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
+                except Exception:
+                    pass
+                return
+            # Si el fallback también falla, propagar el error original
+            raise
 
     result = await loop.run_in_executor(_download_executor, download)
     filename, duration, is_video = result
