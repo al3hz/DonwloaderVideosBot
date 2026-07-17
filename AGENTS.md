@@ -42,6 +42,7 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 - **State management:** Use a single "Processing..." status message. Always **edit** this message to show progress or report failure. Never send duplicate/spammy error messages.
 - **Error translations:** Catch known `yt-dlp` exceptions (e.g., Geo-restriction, private video, deleted content) and map them to friendly, localized Spanish errors instead of throwing raw stack traces to the user.
+- **Start message sync:** Whenever a new platform or feature is added (e.g., GIF support, a new domain), the `/start` command text must be updated to reflect it. This ensures users always see an accurate list of supported platforms and capabilities.
 
 ---
 

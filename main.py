@@ -48,7 +48,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "• TikTok (sin marca de agua)\n"
         "• Instagram (Reels)\n"
         "• Facebook (Reels)\n"
-        "• Twitter / X\n\n"
+        "• Twitter / X (Videos / GIF)\n\n"
         "⚠️ Límite: 50 MB por archivo (límite de Telegram para bots)."
     )
     await update.message.reply_text(text)
@@ -57,6 +57,7 @@ class ProgressTracker:
     """Rastrea el progreso de descarga de yt-dlp y actualiza el mensaje de Telegram."""
 
     def __init__(self, loop, message):
+        logging.debug("ProgressTracker inicializado")
         self.loop = loop
         self.message = message
         self.last_pct = -1
@@ -221,6 +222,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Intento 1: detectar slideshow via yt-dlp
             def try_ydl():
+                logging.debug("try_ydl: extrayendo info via yt-dlp")
                 with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                     return ydl.extract_info(clean_url, download=False)
 
@@ -257,6 +259,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 # Descarga todas las imágenes del slideshow
                 def dl_slideshow():
+                    logging.debug("dl_slideshow: descargando imagenes")
                     paths = []
                     targets = api_images if api_images else [sf.get("url") for sf in slideshow_formats]
                     for i, img_url in enumerate(targets):
@@ -309,6 +312,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # Función bloqueante que corre en el executor para no bloquear el event loop
         def download():
+            logging.debug("download: iniciando yt-dlp")
             opts = get_ydl_opts(tracker.hook)
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
@@ -476,6 +480,7 @@ def ensure_bot():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     """Recibe y procesa las actualizaciones de Telegram vía webhook."""
+    logging.debug("Webhook recibido")
     if not ensure_bot():
         return "Bot not ready", 503
     update = Update.de_json(request.get_json(force=True), application.bot)
@@ -487,7 +492,9 @@ def webhook():
 def health():
     """Endpoint de salud para el deploy."""
     if not _bot_ready:
+        logging.warning("Health check: bot no listo")
         return "Bot not ready", 503
+    logging.debug("Health check OK")
     return "OK", 200
 
 if __name__ == "__main__":
