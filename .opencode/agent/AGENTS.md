@@ -69,6 +69,7 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 | `ADMIN_IDS` | ❌ | — | IDs de Telegram separados por coma para `/stats` |
 | `COOKIES_FILE` | ❌ | `<tempdir>/cookies.txt` | Ruta al archivo de cookies |
 | `YDL_CACHE_DIR` | ❌ | `<tempdir>/ydl_cache` | Directorio para caché de extractores de yt-dlp |
+| `MAX_URLS_PER_MESSAGE` | ❌ | `20` | Máximo de URLs permitidas por mensaje |
 | `PORT` | ❌ | `8080` | Puerto del servidor Flask |
 
 ---

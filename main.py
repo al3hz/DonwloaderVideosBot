@@ -30,6 +30,7 @@ ADMIN_IDS = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") 
 ALLOWED_DOMAINS = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com"]
 COOKIES_FILE = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
+MAX_URLS_PER_MESSAGE = int(os.environ.get("MAX_URLS_PER_MESSAGE", 20))
 
 # ============================================================
 # Estadísticas globales (thread-safe)
@@ -211,6 +212,16 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     candidate_urls = [line.strip() for line in raw_text.replace("\r\n", "\n").split("\n") if line.strip()]
     logging.info(f"{len(candidate_urls)} URL(s) recibida(s) de {user.id}")
 
+    # Limitar cantidad de URLs por mensaje para evitar abusos
+    if len(candidate_urls) > MAX_URLS_PER_MESSAGE:
+        logging.warning(f"Exceso de URLs de {user.id}: {len(candidate_urls)} (máx {MAX_URLS_PER_MESSAGE})")
+        await update.message.reply_text(
+            f"❌ Máximo **{MAX_URLS_PER_MESSAGE} enlaces** por mensaje.\n"
+            f"Enviaste {len(candidate_urls)}. Dividí en varios mensajes.",
+            parse_mode="Markdown",
+        )
+        return
+
     # Validar cada URL y quedarse solo con las válidas
     valid_urls = []
     for url in candidate_urls:
@@ -324,6 +335,10 @@ async def _queue_worker(user_id: int):
                 ),
                 "This video is only available for registered users": (
                     "❌ Este video requiere inicio de sesión en la plataforma."
+                ),
+                "may not be comfortable for some audiences": (
+                    "❌ Este video fue marcado como **sensible** por TikTok.\n"
+                    "No es posible descargarlo sin iniciar sesión."
                 ),
             }
             display_msg = f"❌ Error de descarga:\n`{err_msg[:200]}`"
