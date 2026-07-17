@@ -878,7 +878,6 @@ async def _execute_download(task: DownloadTask):
                 u_clean = u.rstrip(".,:;")
                 parsed = urlparse(u_clean)
                 if "reddit.com/media" in u_clean and parsed.query:
-                    from urllib.parse import parse_qs
                     params = parse_qs(parsed.query)
                     if "url" in params:
                         media_url = params["url"][0]
