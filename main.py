@@ -6,6 +6,8 @@ import tempfile
 import logging
 import concurrent.futures
 import subprocess
+import traceback
+import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
@@ -98,7 +100,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "• Instagram (Reels)\n"
         "• Facebook (videos / Reels)\n"
         "• Twitter / X (Videos / GIF)\n"
-        "• Reddit (videos)\n\n"
+        "• Reddit (videos, imágenes y GIFs)\n\n"
         "📦 **Cola por usuario:**\n"
         "Puedes enviar varios enlaces seguidos. Se procesarán en orden.\n\n"
         "⚠️ Límite: 50 MB por archivo."
@@ -201,88 +203,167 @@ def _tiktok_api_fallback(url):
 # Fallback para Reddit: descarga directa de imágenes/GIFs
 # ============================================================
 
+def _get_reddit_media_url(post_url: str) -> str | None:
+    """
+    Obtiene la URL directa del recurso multimedia (imagen/GIF) de un post de Reddit.
+    Estrategias en orden:
+    1. yt-dlp con process=False  (fallo conocido en datacenters)
+    2. API oembed de Reddit       (ligera, suele funcionar)
+    3. API JSON directa           (más pesada, último recurso)
+    """
+    clean_url = post_url.split("?")[0]
+
+    # --- Estrategia 1: yt-dlp ---
+    try:
+        with yt_dlp.YoutubeDL({
+            "quiet": True, "no_warnings": True,
+            "socket_timeout": 20, "impersonate": "",
+        }) as ydl:
+            info = ydl.extract_info(clean_url, download=False, process=False)
+            media_url = info.get("url")
+            if media_url and any(
+                d in media_url for d in
+                ["i.redd.it", "i.reddituploads.com", "preview.redd.it"]
+            ):
+                logging.info(f"Reddit URL obtenida via yt-dlp: {media_url}")
+                return media_url
+    except Exception:
+        logging.debug("Estrategia 1 (yt-dlp) falló")
+
+    # --- Estrategia 2: oembed API ---
+    try:
+        oembed_url = f"https://www.reddit.com/oembed?url={clean_url}&format=json"
+        resp = requests.get(
+            oembed_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # oembed devuelve thumbnail_url para imágenes, url para videos
+            candidate = data.get("thumbnail_url") or data.get("url")
+            if candidate:
+                logging.info(f"Reddit URL obtenida via oembed: {candidate}")
+                return candidate
+    except Exception:
+        logging.debug("Estrategia 2 (oembed) falló")
+
+    # --- Estrategia 3: API JSON directa ---
+    try:
+        match = re.search(r"/comments/([^/]+)", clean_url)
+        if match:
+            post_id = match.group(1)
+            sub_match = re.search(r"/r/([^/]+)", clean_url)
+            sub = sub_match.group(1) if sub_match else ""
+            api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.json"
+            resp = requests.get(
+                api_url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                post_data = data[0]["data"]["children"][0]["data"]
+                media_url = post_data.get("url")
+                if media_url:
+                    logging.info(f"Reddit URL obtenida via JSON API: {media_url}")
+                    return media_url
+    except Exception:
+        logging.debug("Estrategia 3 (JSON API) falló")
+
+    return None
+
+
+def _download_reddit_media(media_url: str, post_id: str) -> str | None:
+    """
+    Descarga un archivo multimedia (imagen/GIF) desde una URL directa,
+    detecta la extensión real por Content-Type y lo guarda en tempfile.
+    Retorna la ruta del archivo o None si falla.
+    """
+    try:
+        # Seguir redirecciones hasta la URL final
+        try:
+            head = requests.head(
+                media_url, allow_redirects=True, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            final_url = head.url
+        except Exception:
+            final_url = media_url
+
+        # Determinar extensión por Content-Type
+        ext = "jpg"
+        try:
+            resp = requests.head(
+                final_url, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            ct = resp.headers.get("Content-Type", "")
+            if "gif" in ct:
+                ext = "gif"
+            elif "png" in ct:
+                ext = "png"
+            elif "jpeg" in ct or "jpg" in ct:
+                ext = "jpg"
+            elif "webp" in ct:
+                ext = "webp"
+            else:
+                path = urlparse(final_url).path
+                ext = path.split(".")[-1].lower() if "." in path else "jpg"
+        except Exception:
+            path = urlparse(final_url).path
+            ext = path.split(".")[-1].lower() if "." in path else "jpg"
+
+        if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
+            logging.warning(f"Reddit download: extensión no soportada {ext}")
+            return None
+
+        logging.info(f"Reddit download: descargando {final_url} (ext={ext})")
+
+        r = requests.get(
+            final_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=60,
+        )
+        r.raise_for_status()
+
+        filename = os.path.join(
+            tempfile.gettempdir(),
+            f"reddit_img_{post_id}.{ext}",
+        )
+        with open(filename, "wb") as f:
+            f.write(r.content)
+
+        logging.info(f"Reddit download: {filename} ({len(r.content)} bytes)")
+        return filename
+
+    except Exception as e:
+        logging.warning(f"Reddit download: error {e}")
+        return None
+
+
 def _reddit_image_fallback(url):
     """
     Fallback para posts de Reddit que contienen imágenes o GIFs en lugar de videos.
-    1. Limpia la URL (quita parámetros share que interfieren)
-    2. Usa yt-dlp con process=False para obtener la URL directa del recurso
-    3. Descarga la imagen/GIF y la guarda con la extensión correcta
+    1. Limpia la URL (quita parámetros share)
+    2. Obtiene la URL del recurso multimedia (_get_reddit_media_url)
+    3. Descarga la imagen/GIF (_download_reddit_media)
     """
     logging.info(f"Usando fallback de imagen Reddit para {url}")
     try:
-        # Limpiar URL: eliminar query params y resolver /s/ -> /comments/
         clean_url = url.split("?")[0]
-        # Si es /s/, intentar resolver la redirección para obtener /comments/
-        if "/s/" in clean_url:
-            try:
-                head = requests.head(clean_url, allow_redirects=True, timeout=15,
-                                     headers={"User-Agent": "Mozilla/5.0"})
-                if head.url and "/comments/" in head.url:
-                    clean_url = head.url.split("?")[0]
-                    logging.info(f"Reddit fallback: /s/ resuelto a {clean_url}")
-            except Exception:
-                pass
 
-        # Extraer info sin procesar la URL incrustada
-        with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True, "socket_timeout": 20, "impersonate": ""}) as ydl:
-            info = ydl.extract_info(clean_url, download=False, process=False)
-            media_url = info.get("url")
-            if not media_url:
-                logging.warning("Reddit fallback: no se encontró URL en la info extraída")
-                return None
+        # Obtener URL del recurso multimedia
+        media_url = _get_reddit_media_url(clean_url)
+        if not media_url:
+            logging.warning("Reddit fallback: no se pudo obtener la URL del recurso")
+            return None
 
-            # La URL puede ser del post (debe redirigir a i.redd.it) o directa a i.redd.it
-            # Seguir redirecciones hasta obtener la URL directa del archivo
-            try:
-                head = requests.head(media_url, allow_redirects=True, timeout=15,
-                                     headers={"User-Agent": "Mozilla/5.0"})
-                final_url = head.url
-            except Exception:
-                final_url = media_url
+        # Extraer un ID para el nombre del archivo
+        post_id_match = re.search(r"/comments/([^/]+)", clean_url)
+        post_id = post_id_match.group(1) if post_id_match else str(int(time.time()))
 
-            # Determinar extensión real desde Content-Type o desde la URL final
-            ext = "jpg"  # default
-            try:
-                resp = requests.head(final_url, timeout=15,
-                                     headers={"User-Agent": "Mozilla/5.0"})
-                ct = resp.headers.get("Content-Type", "")
-                if "gif" in ct:
-                    ext = "gif"
-                elif "png" in ct:
-                    ext = "png"
-                elif "jpeg" in ct or "jpg" in ct:
-                    ext = "jpg"
-                elif "webp" in ct:
-                    ext = "webp"
-                else:
-                    # Fallback a extensión de la URL
-                    path = urlparse(final_url).path
-                    ext = path.split(".")[-1].lower() if "." in path else "jpg"
-            except Exception:
-                path = urlparse(final_url).path
-                ext = path.split(".")[-1].lower() if "." in path else "jpg"
-
-            if ext not in ("jpg", "jpeg", "png", "gif", "webp"):
-                logging.warning(f"Reddit fallback: extensión no soportada {ext}")
-                return None
-
-            logging.info(f"Reddit fallback: descargando {final_url} (ext={ext})")
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            }
-            r = requests.get(final_url, headers=headers, timeout=60)
-            r.raise_for_status()
-
-            post_id = info.get("id") or str(int(time.time()))
-            filename = os.path.join(
-                tempfile.gettempdir(),
-                f"reddit_img_{post_id}.{ext}",
-            )
-            with open(filename, "wb") as f:
-                f.write(r.content)
-
-            logging.info(f"Reddit fallback: imagen descargada en {filename} ({len(r.content)} bytes)")
-            return filename
+        return _download_reddit_media(media_url, post_id)
 
     except Exception as e:
         logging.warning(f"Reddit fallback: error {e}")
@@ -299,6 +380,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Soporta múltiples URLs en un solo mensaje (una por línea).
     Se procesarán en orden FIFO por usuario.
     """
+    # Proteger contra actualizaciones sin mensaje (callback_query, channel_post, etc.)
+    if not update.message or not update.message.text:
+        logging.warning(f"Update ignorado — sin message.text: type={update.update_id}")
+        return
+
     raw_text = update.message.text.strip()
     user = update.effective_user
     chat_id = update.effective_chat.id
@@ -418,8 +504,12 @@ async def _queue_worker(user_id: int):
             await _execute_download(task)
         except yt_dlp.utils.DownloadError as e:
             # Error conocido de yt-dlp: mostrar mensaje amigable
-            err_msg = str(e)
+            err_msg = str(e) or "(sin mensaje)"
             logging.error(f"DownloadError para {task.url}: {err_msg}")
+            logging.debug(traceback.format_exc())
+
+            # Detectar plataforma para mensajes contextuales
+            url_lower = task.url.lower()
             friendly = {
                 "No video could be found in this tweet": (
                     "❌ No se pudo encontrar un video en ese tweet.\n"
@@ -441,7 +531,8 @@ async def _queue_worker(user_id: int):
                 ),
                 "Unsupported URL": (
                     "❌ Ese enlace de Reddit no contiene un video.\n"
-                    "Solo puedo descargar posts de Reddit que tengan videos (v.redd.it)."
+                    "Solo puedo descargar posts de Reddit que tengan videos (v.redd.it) "
+                    "o imágenes/GIFs individuales."
                 ),
             }
             display_msg = f"❌ Error de descarga:\n`{err_msg[:200]}`"
@@ -449,6 +540,22 @@ async def _queue_worker(user_id: int):
                 if key in err_msg:
                     display_msg = msg
                     break
+
+            # Si el mensaje está vacío o no se pudo clasificar, dar contexto según plataforma
+            if not err_msg.strip() or err_msg.strip() == "(sin mensaje)":
+                if "instagram.com" in url_lower:
+                    display_msg = (
+                        "❌ No se pudo descargar ese Reel de Instagram.\n"
+                        "Puede ser un video privado, requerir inicio de sesión, "
+                        "o Instagram cambió algo en su sitio. Probá de nuevo más tarde."
+                    )
+                elif "tiktok.com" in url_lower:
+                    display_msg = (
+                        "❌ No se pudo descargar ese video de TikTok.\n"
+                        "Puede ser un video privado, requerir inicio de sesión, "
+                        "o TikTok cambió algo en su sitio. Probá de nuevo más tarde."
+                    )
+
             try:
                 await application.bot.edit_message_text(
                     chat_id=task.chat_id,
@@ -461,14 +568,34 @@ async def _queue_worker(user_id: int):
             _inc_stats("failed")
 
         except Exception as e:
-            # Error inesperado
-            msg = str(e)[:200]
+            # Error inesperado — loguear traceback completo
+            msg = str(e)[:200] or "(sin mensaje)"
             logging.error(f"Error inesperado para {task.url}: {msg}")
+            logging.debug(traceback.format_exc())
+
+            display_msg = f"❌ Error inesperado:\n`{msg}`"
+
+            # Si el error está vacío, dar contexto según plataforma
+            if not str(e).strip():
+                url_lower = task.url.lower()
+                if "instagram.com" in url_lower:
+                    display_msg = (
+                        "❌ No se pudo descargar ese Reel de Instagram.\n"
+                        "Puede ser un video privado, requerir inicio de sesión, "
+                        "o Instagram cambió algo en su sitio. Probá de nuevo más tarde."
+                    )
+                elif "tiktok.com" in url_lower:
+                    display_msg = (
+                        "❌ No se pudo descargar ese video de TikTok.\n"
+                        "Puede ser un video privado, requerir inicio de sesión, "
+                        "o TikTok cambió algo en su sitio. Probá de nuevo más tarde."
+                    )
+
             try:
                 await application.bot.edit_message_text(
                     chat_id=task.chat_id,
                     message_id=task.processing_msg_id,
-                    text=f"❌ Error inesperado:\n`{msg}`",
+                    text=display_msg,
                     parse_mode="Markdown",
                 )
             except Exception:

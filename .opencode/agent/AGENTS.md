@@ -8,7 +8,7 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 
 - **Runtime:** Python 3.11+ using native `asyncio`.
 - **Telegram Framework:** `python-telegram-bot` v22 (Application API utilizing Webhooks).
-- **Core Downloader:** `yt-dlp` (Stream selection priority: `best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best`).
+- **Core Downloader:** `yt-dlp` (Stream selection priority: `bestvideo[filesize<50M]+bestaudio/best[filesize<50M]/bestvideo+bestaudio/best`).
 - **Web Server:** `Flask` (webhook handler) running under `Gunicorn` (1 worker, 8 threads).
 - **Deployment:** Render (configured via `Procfile`, `requirements.txt`, and `runtime.txt`).
 - **File Structure:** Single-file monolithic script (`main.py`) for clean, self-contained deployment.
@@ -18,14 +18,15 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 
 ## 🔄 Core Workflow & Logic
 
-1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, Facebook, and Twitter/X patterns.
+1. **Input Detection:** Monitor all text messages. Validate domains against known TikTok, Instagram, Facebook, Twitter/X, and Reddit patterns. Guard against `update.message` being `None` (e.g. callback queries, channel posts).
 2. **Instagram Edge-case:** Strictly reject URLs containing `/p/` (photos/carousels) early to prevent redundant download triggers.
 3. **Queue System (FIFO per user):** Each URL received is validated and then enqueued into a per-user `asyncio.Queue`. A dedicated background worker (`_queue_worker`) processes tasks in order. Workers auto-terminate after 5 minutes of inactivity.
 4. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
 5. **Download Phase:** Initialize `yt-dlp`. The output is written to a temp file in `tempfile.gettempdir()`. No progress is shown to the user — only a static ⏳ emoji.
-6. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context.
-7. **Garbage Collection:** Always clean up temporary files, even if the upload fails.
-8. **Metrics:** Track total requests, successful downloads, failed downloads, and unique users in a thread-safe global dict (`_stats` with `_stats_lock`).
+6. **Reddit Image/GIF Fallback:** If yt-dlp fails (e.g. non-video post), a multi-strategy fallback extracts the media URL via: (1) yt-dlp `process=False`, (2) Reddit oembed API, (3) Reddit JSON API. The image/GIF is then downloaded directly with `requests` and sent via Telegram.
+7. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context.
+8. **Garbage Collection:** Always clean up temporary files, even if the upload fails.
+9. **Metrics:** Track total requests, successful downloads, failed downloads, and unique users in a thread-safe global dict (`_stats` with `_stats_lock`).
 
 ---
 
@@ -59,6 +60,7 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 - **State management:** Use a single "⏳" status message. Show "⏳ En cola..." initially, then edit to "⏳" when processing starts. Always **edit** this message to show failure. Never edit it to show download progress. Never send duplicate/spammy error messages.
 - **Error translations:** Catch known `yt-dlp` exceptions (e.g., Geo-restriction, private video, deleted content) and map them to friendly, localized Spanish errors instead of throwing raw stack traces to the user.
+- **Empty errors (Instagram/TikTok):** If `str(e)` is empty (no error text), the bot generates a contextual message based on the platform domain (Instagram → "privado/cambio en el sitio", TikTok → "privado/cambio en el sitio"). The full traceback is logged for debugging.
 - **Start message sync:** Whenever a new platform or feature is added (e.g., GIF support, a new domain, queue system), the `/start` command text must be updated to reflect it. This ensures users always see an accurate list of supported platforms and capabilities.
 
 ### Environment Variables
