@@ -1,9 +1,0 @@
-{
-  "functions": [
-    {
-      "source": ".",
-      "codebase": "default",
-      "ignore": ["venv", ".git", "__pycache__"]
-    }
-  ]
-}

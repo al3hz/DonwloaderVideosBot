@@ -7,9 +7,10 @@ import logging
 import concurrent.futures
 from flask import Flask, request
 from telegram import Update, InputMediaPhoto
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
 import requests
+import subprocess
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -53,17 +54,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-class ProgressTracker:
-    """Rastrea el progreso de descarga de yt-dlp (callback interno)."""
-
-    def __init__(self):
-        logging.debug("ProgressTracker inicializado")
-
-    def hook(self, d):
-        """Callback de yt-dlp (no se muestra progreso al usuario, solo ⏳)."""
-        pass
-
-def get_ydl_opts(progress_hook=None):
+def get_ydl_opts():
     """Retorna las opciones de configuración para yt-dlp con los parámetros del proyecto."""
     opts = {
         "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best",
@@ -78,8 +69,6 @@ def get_ydl_opts(progress_hook=None):
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
         logging.info(f"Usando cookies desde {COOKIES_FILE}")
-    if progress_hook:
-        opts["progress_hooks"] = [progress_hook]
     return opts
 
 def _tiktok_api_fallback(url):
@@ -107,51 +96,6 @@ def _tiktok_api_fallback(url):
         audio_formats = [{"url": music_url, "ext": "mp3"}]
     return (slideshow_formats, audio_formats, images)
 
-
-
-async def tiktok_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Maneja los callbacks de botones inline para descargar imágenes individuales de TikTok slideshows."""
-    query = update.callback_query
-    await query.answer()
-    key = f"tiktok:{query.message.chat_id}:{query.message.message_id}"
-    stored = context.user_data.pop(key, None)
-    if not stored:
-        logging.warning(f"Callback expirado para {key}")
-        await query.edit_message_text("❌ Esta solicitud ya expiró.")
-        return
-
-    proc_id = stored.get("processing_msg_id")
-    if proc_id:
-        try:
-            await context.bot.delete_message(chat_id=query.message.chat_id, message_id=proc_id)
-        except Exception:
-            pass
-
-    logging.info(f"Descargando slide de TikTok para {query.message.chat_id}")
-    await query.edit_message_text("⏳ Descargando imagen...")
-    sf = stored["slideshow_format"]
-    img_url = sf.get("url")
-    if not img_url:
-        logging.error("No se encontró URL de imagen en slideshow_format")
-        await query.edit_message_text("❌ No se pudo obtener la URL de la imagen.")
-        return
-    ext = sf.get("ext", "jpg")
-    filename = os.path.join(tempfile.gettempdir(), f"tiktok_img_{int(time.time())}.{ext}")
-    r = requests.get(img_url, timeout=60)
-    r.raise_for_status()
-    with open(filename, "wb") as f:
-        f.write(r.content)
-    await query.edit_message_text("📤 Subiendo a Telegram...")
-    with open(filename, "rb") as f:
-        await query.message.reply_photo(
-            photo=f,
-            caption=f"📥 Descargado por @{stored['context'].bot.username}",
-        )
-    os.remove(filename)
-    try:
-        await query.delete_message()
-    except Exception:
-        pass
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Procesa un enlace enviado por el usuario: detecta plataforma, descarga y envía el video."""
@@ -321,7 +265,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # Detectar si el archivo tiene audio (si no, se envía como GIF animado)
-        import subprocess
         try:
             probe = subprocess.run(
                 ["ffprobe", "-v", "quiet", "-select_streams", "a", "-show_entries", "stream=codec_type",
@@ -413,7 +356,6 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await processing_msg.delete()
 
 application.add_handler(CommandHandler("start", start))
-application.add_handler(CallbackQueryHandler(tiktok_callback, pattern="^tiktok_"))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, download_video))
 
 # Variables globales para el loop asyncio del bot
