@@ -23,8 +23,8 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 3. **Queue System (FIFO per user):** Each URL received is validated and then enqueued into a per-user `asyncio.Queue`. A dedicated background worker (`_queue_worker`) processes tasks in order. Workers auto-terminate after 5 minutes of inactivity.
 4. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
 5. **Download Phase:** Initialize `yt-dlp`. The output is written to a temp file in `tempfile.gettempdir()`. No progress is shown to the user — only a static ⏳ emoji.
-6. **Reddit Image/GIF Fallback:** If yt-dlp fails (e.g. non-video post), a multi-strategy fallback extracts the media URL via: (1) yt-dlp `process=False`, (2) Reddit oembed API, (3) Reddit JSON API. The image/GIF is then downloaded directly with `requests` and sent via Telegram.
-7. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context.
+6. **Reddit Image/GIF Fallback:** When yt-dlp's first download attempt fails, the error message is parsed to extract the media URL directly (from `reddit.com/media?url=...` or `i.redd.it/...` URLs in the error text). If parsing fails, a multi-strategy fallback resolves `/s/` → `/comments/` then tries: (1) yt-dlp `process=False`, (2) Reddit oembed API, (3) Reddit JSON API. The image/GIF is downloaded directly with `requests` and sent via Telegram.
+7. **Delivery Phase with Retry:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). All `send_video`/`send_animation`/`send_photo` calls are wrapped in `_send_file_with_retry()` which re-opens the file and retries up to 3 times on `TimedOut`/`NetworkError` with exponential backoff. If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context.
 8. **Garbage Collection:** Always clean up temporary files, even if the upload fails.
 9. **Metrics:** Track total requests, successful downloads, failed downloads, and unique users in a thread-safe global dict (`_stats` with `_stats_lock`).
 
@@ -42,7 +42,7 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 - `merge_output_format`: Always force `mp4` for standard Telegram client playback compatibility.
 - `cookies`: Optionally load from a file path defined in `COOKIES_FILE` environment variable, falling back to `tempfile/cookies.txt`.
 - `cachedir`: Always set to `YDL_CACHE_DIR` env var (or `<tempdir>/ydl_cache`). This enables yt-dlp's built-in extractor cache to avoid re-fetching info for repeated URLs.
-- `impersonate`: Always set to `""` (empty string). Enables TLS fingerprint impersonation (auto-select client) via `curl_cffi` when available, to bypass Cloudflare and other bot protections on sites like Reddit. Falls back gracefully if `curl_cffi` is not installed.
+- `impersonate`: NOT set globally in `get_ydl_opts()` because it breaks TikTok and Instagram extractors on Render. Only set to `""` in `_get_reddit_media_url()` for Reddit-specific yt-dlp calls where it's needed for Cloudflare bypass.
 
 ### Queue System
 

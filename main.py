@@ -9,10 +9,11 @@ import subprocess
 import traceback
 import re
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify
 from telegram import Update, InputMediaPhoto
+from telegram.error import TimedOut as TelegramTimedOut, NetworkError as TelegramNetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
 import requests
@@ -155,7 +156,8 @@ def get_ydl_opts():
         "quiet": True,
         "no_warnings": True,
         "cachedir": CACHE_DIR,
-        "impersonate": "",  # auto-seleccionar impersonación si curl_cffi está disponible
+        # NOTA: impersonate NO se usa globalmente porque rompe TikTok/Instagram.
+        # Solo se usa en _get_reddit_media_url para Reddit donde es necesario.
     }
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
@@ -203,15 +205,37 @@ def _tiktok_api_fallback(url):
 # Fallback para Reddit: descarga directa de imágenes/GIFs
 # ============================================================
 
+def _resolve_reddit_url(url: str) -> str:
+    """
+    Resuelve URLs de Reddit acortadas (/s/) a su forma canónica (/comments/).
+    Retorna la URL limpia (sin query params) o la original si falla.
+    """
+    clean = url.split("?")[0]
+    if "/s/" in clean:
+        try:
+            head = requests.head(
+                clean, allow_redirects=True, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            if head.url and "/comments/" in head.url:
+                resolved = head.url.split("?")[0]
+                logging.info(f"URL Reddit /s/ resuelta: {resolved}")
+                return resolved
+        except Exception:
+            logging.debug("No se pudo resolver /s/ — se usará la URL original")
+    return clean
+
+
 def _get_reddit_media_url(post_url: str) -> str | None:
     """
     Obtiene la URL directa del recurso multimedia (imagen/GIF) de un post de Reddit.
-    Estrategias en orden:
+    Primero resuelve /s/ → /comments/, luego prueba estrategias:
     1. yt-dlp con process=False  (fallo conocido en datacenters)
     2. API oembed de Reddit       (ligera, suele funcionar)
     3. API JSON directa           (más pesada, último recurso)
     """
-    clean_url = post_url.split("?")[0]
+    # 0. Resolver /s/ → /comments/
+    resolved_url = _resolve_reddit_url(post_url)
 
     # --- Estrategia 1: yt-dlp ---
     try:
@@ -219,7 +243,7 @@ def _get_reddit_media_url(post_url: str) -> str | None:
             "quiet": True, "no_warnings": True,
             "socket_timeout": 20, "impersonate": "",
         }) as ydl:
-            info = ydl.extract_info(clean_url, download=False, process=False)
+            info = ydl.extract_info(resolved_url, download=False, process=False)
             media_url = info.get("url")
             if media_url and any(
                 d in media_url for d in
@@ -232,7 +256,7 @@ def _get_reddit_media_url(post_url: str) -> str | None:
 
     # --- Estrategia 2: oembed API ---
     try:
-        oembed_url = f"https://www.reddit.com/oembed?url={clean_url}&format=json"
+        oembed_url = f"https://www.reddit.com/oembed?url={resolved_url}&format=json"
         resp = requests.get(
             oembed_url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
@@ -240,7 +264,6 @@ def _get_reddit_media_url(post_url: str) -> str | None:
         )
         if resp.status_code == 200:
             data = resp.json()
-            # oembed devuelve thumbnail_url para imágenes, url para videos
             candidate = data.get("thumbnail_url") or data.get("url")
             if candidate:
                 logging.info(f"Reddit URL obtenida via oembed: {candidate}")
@@ -250,10 +273,10 @@ def _get_reddit_media_url(post_url: str) -> str | None:
 
     # --- Estrategia 3: API JSON directa ---
     try:
-        match = re.search(r"/comments/([^/]+)", clean_url)
+        match = re.search(r"/comments/([^/]+)", resolved_url)
         if match:
             post_id = match.group(1)
-            sub_match = re.search(r"/r/([^/]+)", clean_url)
+            sub_match = re.search(r"/r/([^/]+)", resolved_url)
             sub = sub_match.group(1) if sub_match else ""
             api_url = f"https://www.reddit.com/r/{sub}/comments/{post_id}.json"
             resp = requests.get(
@@ -345,22 +368,23 @@ def _download_reddit_media(media_url: str, post_id: str) -> str | None:
 def _reddit_image_fallback(url):
     """
     Fallback para posts de Reddit que contienen imágenes o GIFs en lugar de videos.
-    1. Limpia la URL (quita parámetros share)
+    1. Resuelve /s/ → /comments/
     2. Obtiene la URL del recurso multimedia (_get_reddit_media_url)
     3. Descarga la imagen/GIF (_download_reddit_media)
     """
     logging.info(f"Usando fallback de imagen Reddit para {url}")
     try:
-        clean_url = url.split("?")[0]
+        # Resolver /s/ → /comments/ antes de pasar a _get_reddit_media_url
+        resolved = _resolve_reddit_url(url)
 
         # Obtener URL del recurso multimedia
-        media_url = _get_reddit_media_url(clean_url)
+        media_url = _get_reddit_media_url(resolved)
         if not media_url:
             logging.warning("Reddit fallback: no se pudo obtener la URL del recurso")
             return None
 
         # Extraer un ID para el nombre del archivo
-        post_id_match = re.search(r"/comments/([^/]+)", clean_url)
+        post_id_match = re.search(r"/comments/([^/]+)", resolved)
         post_id = post_id_match.group(1) if post_id_match else str(int(time.time()))
 
         return _download_reddit_media(media_url, post_id)
@@ -606,6 +630,33 @@ async def _queue_worker(user_id: int):
             queue.task_done()
 
 # ============================================================
+# Helper: reintentar envío a Telegram con backoff
+# ============================================================
+
+async def _send_file_with_retry(bot, filename, send_factory, max_retries=3):
+    """
+    Abre `filename` en modo 'rb', ejecuta `send_factory(file_obj)` y reintenta
+    si falla con TimedOut o NetworkError. Cada reintento re-abre el archivo
+    para evitar problemas con el puntero de lectura.
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            with open(filename, "rb") as f:
+                return await send_factory(f)
+        except (TelegramTimedOut, TelegramNetworkError) as e:
+            last_exc = e
+            delay = 2 * (2 ** attempt)
+            logging.warning(f"Reintento {attempt+1}/{max_retries} en {delay}s: {e}")
+            await asyncio.sleep(delay)
+        except Exception:
+            # Errores no recuperables (p.ej. mensaje muy grande) relanzar inmediatamente
+            raise
+    logging.error(f"Se agotaron los reintentos para enviar {filename}: {last_exc}")
+    raise last_exc
+
+
+# ============================================================
 # Ejecución real de la descarga
 # ============================================================
 
@@ -816,8 +867,43 @@ async def _execute_download(task: DownloadTask):
         try:
             result = await loop.run_in_executor(_download_executor, download)
         except Exception as e:
-            logging.info(f"Reddit: descarga normal falló, probando fallback de imagen: {e}")
-            img_filename = await loop.run_in_executor(_download_executor, _reddit_image_fallback, url)
+            err_text = str(e)
+            logging.info(f"Reddit: descarga normal falló: {err_text[:200]}")
+
+            # Intentar extraer URL del recurso desde el error de yt-dlp
+            # Formato: "ERROR: Unsupported URL: https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2F..."
+            img_filename = None
+            unsupported_urls = re.findall(r'https?://[^\s"\']+', err_text)
+            for u in unsupported_urls:
+                u_clean = u.rstrip(".,:;")
+                parsed = urlparse(u_clean)
+                if "reddit.com/media" in u_clean and parsed.query:
+                    from urllib.parse import parse_qs
+                    params = parse_qs(parsed.query)
+                    if "url" in params:
+                        media_url = params["url"][0]
+                        logging.info(f"Reddit: URL extraída del error: {media_url}")
+                        img_filename = await loop.run_in_executor(
+                            _download_executor, _download_reddit_media,
+                            media_url, str(int(time.time()))
+                        )
+                        if img_filename:
+                            logging.info(f"Reddit: descarga directa exitosa: {img_filename}")
+                            break
+                elif any(d in u_clean for d in ["i.redd.it", "i.reddituploads.com", "preview.redd.it"]):
+                    logging.info(f"Reddit: URL directa extraída del error: {u_clean}")
+                    img_filename = await loop.run_in_executor(
+                        _download_executor, _download_reddit_media,
+                        u_clean, str(int(time.time()))
+                    )
+                    if img_filename:
+                        break
+
+            # Si no se pudo extraer del error, usar el fallback multi-estrategia
+            if not img_filename:
+                img_filename = await loop.run_in_executor(
+                    _download_executor, _reddit_image_fallback, url
+                )
             if img_filename:
                 file_size = os.path.getsize(img_filename)
                 if file_size > 50 * 1024 * 1024:
@@ -832,17 +918,21 @@ async def _execute_download(task: DownloadTask):
                 ext = os.path.splitext(img_filename)[1].lower()
                 caption = f"📥 Descargado por @{task.bot_username}"
                 if ext == ".gif":
-                    with open(img_filename, "rb") as f:
-                        await bot.send_animation(
+                    await _send_file_with_retry(
+                        bot, img_filename,
+                        lambda f: bot.send_animation(
                             chat_id=task.chat_id, animation=f, caption=caption,
                             read_timeout=120, write_timeout=120, connect_timeout=30,
-                        )
+                        ),
+                    )
                 else:
-                    with open(img_filename, "rb") as f:
-                        await bot.send_photo(
+                    await _send_file_with_retry(
+                        bot, img_filename,
+                        lambda f: bot.send_photo(
                             chat_id=task.chat_id, photo=f, caption=caption,
                             read_timeout=120, write_timeout=120, connect_timeout=30,
-                        )
+                        ),
+                    )
                 os.remove(img_filename)
                 _inc_stats("successful")
                 try:
@@ -891,19 +981,22 @@ async def _execute_download(task: DownloadTask):
     caption = f"📥 Descargado por @{task.bot_username}"
 
     if is_video and not has_audio_stream:
-        with open(filename, "rb") as f:
-            await bot.send_animation(
+        await _send_file_with_retry(
+            bot, filename,
+            lambda f: bot.send_animation(
                 chat_id=task.chat_id,
                 animation=f,
                 caption=caption,
                 read_timeout=120,
                 write_timeout=120,
                 connect_timeout=30,
-            )
+            ),
+        )
         logging.info(f"GIF enviado: {filename}")
     elif is_video:
-        with open(filename, "rb") as f:
-            await bot.send_video(
+        await _send_file_with_retry(
+            bot, filename,
+            lambda f: bot.send_video(
                 chat_id=task.chat_id,
                 video=f,
                 caption=caption,
@@ -912,18 +1005,21 @@ async def _execute_download(task: DownloadTask):
                 read_timeout=120,
                 write_timeout=120,
                 connect_timeout=30,
-            )
+            ),
+        )
         logging.info(f"Video enviado: {filename}")
     else:
-        with open(filename, "rb") as f:
-            await bot.send_photo(
+        await _send_file_with_retry(
+            bot, filename,
+            lambda f: bot.send_photo(
                 chat_id=task.chat_id,
                 photo=f,
                 caption=caption,
                 read_timeout=120,
                 write_timeout=120,
                 connect_timeout=30,
-            )
+            ),
+        )
         logging.info(f"Foto enviada: {filename}")
 
     os.remove(filename)
