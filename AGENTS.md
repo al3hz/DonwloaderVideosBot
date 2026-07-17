@@ -21,7 +21,7 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 2. **Instagram Edge-case:** Strictly reject URLs containing `/p/` (photos/carousels) early to prevent redundant download triggers.
 3. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
 4. **Download Phase:** Initialize `yt-dlp` with a progress hook. Stream the output directly, handling network drops gracefully with retries.
-5. **Delivery Phase:** Upload the local video via Telegram (`read_timeout=120`, file limit `< 50 MB`).
+5. **Delivery Phase:** Upload via Telegram (`read_timeout=120`, file limit `< 50 MB`). If the file has no audio stream, it is sent as `reply_animation` (GIF) instead of `reply_video`.
 6. **Garbage Collection:** Always clean up temporary files in a `finally` block or an `async` context manager, even if the upload fails.
 
 ---

@@ -347,8 +347,27 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await processing_msg.edit_text("📤 Subiendo a Telegram...")
 
-        # Enviar el archivo según su tipo
-        if is_video:
+        # Detectar si el archivo tiene audio (si no, se envía como GIF animado)
+        import subprocess
+        try:
+            probe = subprocess.run(
+                ["ffprobe", "-v", "quiet", "-select_streams", "a", "-show_entries", "stream=codec_type",
+                 "-of", "csv=p=0", filename],
+                capture_output=True, text=True, timeout=10
+            )
+            has_audio_stream = bool(probe.stdout.strip())
+        except Exception:
+            has_audio_stream = True
+
+        if is_video and not has_audio_stream:
+            with open(filename, "rb") as f:
+                await update.message.reply_animation(
+                    animation=f,
+                    caption=f"📥 Descargado por @{context.bot.username}",
+                    read_timeout=120,
+                )
+            logging.info(f"GIF enviado: {filename}")
+        elif is_video:
             with open(filename, "rb") as f:
                 await update.message.reply_video(
                     video=f,
