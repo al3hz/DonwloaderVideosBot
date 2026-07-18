@@ -24,7 +24,7 @@ System-level instructions and architectural guidelines for **DownloaderVideosBot
 4. **TikTok Slideshows:** Detect `/photo/` URLs. Bypass `yt-dlp` and utilize the `tikwm.com` API as a robust fallback.
 5. **Download Phase:** Initialize `yt-dlp`. The output is written to a temp file in `tempfile.gettempdir()`. No progress is shown to the user — only a static ⏳ emoji.
 6. **Reddit Image/GIF Fallback:** When yt-dlp's first download attempt fails, the error message is parsed to extract the media URL directly (from `reddit.com/media?url=...` or `i.redd.it/...` URLs in the error text). If parsing fails, a multi-strategy fallback resolves `/s/` → `/comments/` then tries: (1) yt-dlp `process=False`, (2) Reddit oembed API, (3) Reddit JSON API. The image/GIF is downloaded directly with `requests` and sent via Telegram.
-7. **Delivery Phase with Retry:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). All `send_video`/`send_animation`/`send_photo` calls are wrapped in `_send_file_with_retry()` which re-opens the file and retries up to 3 times on `TimedOut`/`NetworkError` with exponential backoff. If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context.
+7. **Delivery Phase with Retry:** Upload via Telegram (`read_timeout=120`, `write_timeout=120`, `connect_timeout=30`, file limit `< 50 MB`). All `send_video`/`send_animation`/`send_photo` calls are wrapped in `_send_file_with_retry()` which re-opens the file and retries up to 3 times on `TimedOut`/`NetworkError` with exponential backoff. If the file has no audio stream, it is sent as `send_animation` (GIF) instead of `send_video`. All uploads use `application.bot.send_*()` (not `update.message.reply_*()`) because the download runs in the queue worker context. **Chat Action:** Before each upload, `bot.send_chat_action()` is called with the appropriate action (`UPLOAD_VIDEO` for videos/GIFs, `UPLOAD_PHOTO` for photos/albums) so Telegram shows a "subiendo..." status to the user.
 8. **Garbage Collection:** Always clean up temporary files, even if the upload fails.
 9. **Metrics:** Track total requests, successful downloads, failed downloads, and unique users in a thread-safe global dict (`_stats` with `_stats_lock`).
 
@@ -39,6 +39,12 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 - `socket_timeout`: `120` seconds.
 - `extractor_retries`: `3` attempts.
 - `file_access_retries`: `3` attempts.
+- `retries`: `5` (HTTP retries, default is 10, lowered to avoid waiting too long on unresponsive servers).
+- `retry_sleep`: `"linear=1:5"` (sleeps 1s, 2s, 3s, 4s, 5s between retries instead of retrying instantly).
+- `concurrent_fragments`: `3` (downloads up to 3 fragments in parallel for DASH/HLS videos, speeding up downloads).
+- `check_formats`: `True` (verifies formats are actually accessible before downloading, reducing mid-download failures).
+- `ratelimit`: `10 * 1024 * 1024` (10 MB/s max to avoid saturating Render's shared bandwidth).
+- `embedthumbnail`: `True` (best-effort embedding of thumbnail into the video as cover art via ffmpeg).
 - `merge_output_format`: Always force `mp4` for standard Telegram client playback compatibility.
 - `cookies`: Optionally load from a file path defined in `COOKIES_FILE` environment variable, falling back to `tempfile/cookies.txt`.
 - `cachedir`: Always set to `YDL_CACHE_DIR` env var (or `<tempdir>/ydl_cache`). This enables yt-dlp's built-in extractor cache to avoid re-fetching info for repeated URLs.

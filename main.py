@@ -13,6 +13,7 @@ from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify
 from telegram import Update, InputMediaPhoto
+from telegram.constants import ChatAction
 from telegram.error import TimedOut as TelegramTimedOut, NetworkError as TelegramNetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import yt_dlp
@@ -153,6 +154,12 @@ def get_ydl_opts():
         "socket_timeout": 120,
         "extractor_retries": 3,
         "file_access_retries": 3,
+        "retries": 5,
+        "retry_sleep": "linear=1:5",
+        "concurrent_fragments": 3,
+        "check_formats": True,
+        "ratelimit": 10 * 1024 * 1024,  # 10 MB/s máx para no saturar Render
+        "embedthumbnail": True,
         "quiet": True,
         "no_warnings": True,
         "cachedir": CACHE_DIR,
@@ -795,6 +802,9 @@ async def _execute_download(task: DownloadTask):
                 return
 
             # Enviar álbum en lotes de 10
+            await bot.send_chat_action(
+                chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO
+            )
             caption_text = f"📥 Descargado por @{task.bot_username}"
             for batch_start in range(0, len(img_paths), 10):
                 batch = img_paths[batch_start : batch_start + 10]
@@ -917,6 +927,9 @@ async def _execute_download(task: DownloadTask):
                 ext = os.path.splitext(img_filename)[1].lower()
                 caption = f"📥 Descargado por @{task.bot_username}"
                 if ext == ".gif":
+                    await bot.send_chat_action(
+                        chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO
+                    )
                     await _send_file_with_retry(
                         bot, img_filename,
                         lambda f: bot.send_animation(
@@ -925,6 +938,9 @@ async def _execute_download(task: DownloadTask):
                         ),
                     )
                 else:
+                    await bot.send_chat_action(
+                        chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO
+                    )
                     await _send_file_with_retry(
                         bot, img_filename,
                         lambda f: bot.send_photo(
@@ -980,6 +996,9 @@ async def _execute_download(task: DownloadTask):
     caption = f"📥 Descargado por @{task.bot_username}"
 
     if is_video and not has_audio_stream:
+        await bot.send_chat_action(
+            chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO
+        )
         await _send_file_with_retry(
             bot, filename,
             lambda f: bot.send_animation(
@@ -993,6 +1012,9 @@ async def _execute_download(task: DownloadTask):
         )
         logging.info(f"GIF enviado: {filename}")
     elif is_video:
+        await bot.send_chat_action(
+            chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO
+        )
         await _send_file_with_retry(
             bot, filename,
             lambda f: bot.send_video(
@@ -1008,6 +1030,9 @@ async def _execute_download(task: DownloadTask):
         )
         logging.info(f"Video enviado: {filename}")
     else:
+        await bot.send_chat_action(
+            chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO
+        )
         await _send_file_with_retry(
             bot, filename,
             lambda f: bot.send_photo(
