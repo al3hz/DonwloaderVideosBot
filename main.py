@@ -175,6 +175,27 @@ def get_ydl_opts():
 # Fallback para TikTok Slideshows
 # ============================================================
 
+def _resolve_tiktok_url(url):
+    """
+    Resuelve URLs acortadas de TikTok (vt.tiktok.com) a su forma completa
+    (www.tiktok.com/@user/video/...). Retorna la URL resuelta (sin query params)
+    o la URL original limpia si falla.
+    """
+    parsed = urlparse(url)
+    if parsed.hostname and parsed.hostname.replace("www.", "") == "vt.tiktok.com":
+        try:
+            head = requests.head(
+                url, allow_redirects=True, timeout=15,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            )
+            resolved = head.url.split("?")[0]
+            logging.info(f"URL TikTok resuelta: {resolved}")
+            return resolved
+        except Exception as e:
+            logging.warning(f"No se pudo resolver URL TikTok corta: {e}")
+    return url.split("?")[0]
+
+
 def _tiktok_api_fallback(url):
     """
     Fallback para TikTok slideshows usando la API de tikwm.com
@@ -185,9 +206,11 @@ def _tiktok_api_fallback(url):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept": "application/json, text/plain, */*",
     }
+    # Resolver URLs acortadas antes de enviar a tikwm.com
+    api_url = _resolve_tiktok_url(url)
     resp = requests.post(
         "https://tikwm.com/api/",
-        data={"url": url.split("?")[0]},
+        data={"url": api_url},
         headers=headers,
         timeout=30,
     )
@@ -214,6 +237,11 @@ def _tiktok_video_api_fallback(url):
     Fallback para videos de TikTok (contenido sensible / age-restricted)
     usando la API de tikwm.com. Descarga el video directamente y
     retorna la ruta del archivo, o None si falla.
+
+    La API de tikwm.com devuelve el video en los campos:
+      - 'play'  -> video sin marca de agua (HD)
+      - 'wmplay' -> video con marca de agua
+      - 'video' / 'video_with_watermark' (alias alternativos)
     """
     logging.info(f"Usando fallback tikwm.com para video TikTok: {url}")
     headers = {
@@ -221,22 +249,33 @@ def _tiktok_video_api_fallback(url):
         "Accept": "application/json, text/plain, */*",
     }
     try:
+        # Resolver URLs acortadas (vt.tiktok.com) antes de enviar a tikwm.com
+        api_url = _resolve_tiktok_url(url)
+
         resp = requests.post(
             "https://tikwm.com/api/",
-            data={"url": url.split("?")[0]},
+            data={"url": api_url},
             headers=headers,
             timeout=30,
         )
         data = resp.json()
         if data.get("code") != 0:
-            logging.warning(f"tikwm.com respondió con código {data.get('code')}")
+            logging.warning(f"tikwm.com respondió con código {data.get('code')}: {data.get('msg', '')}")
             return None
+
         result = data.get("data", {})
-        # Priorizar video sin marca de agua; si no, usar el que tenga watermark
-        video_url = result.get("video") or result.get("video_with_watermark")
+        # La API usa 'play' para video HD sin marca de agua y 'wmplay' para watermark.
+        # También aceptamos 'video' / 'video_with_watermark' por compatibilidad.
+        video_url = (
+            result.get("play")
+            or result.get("video")
+            or result.get("wmplay")
+            or result.get("video_with_watermark")
+        )
         if not video_url:
-            logging.warning("tikwm.com no devolvió URL de video")
+            logging.warning(f"tikwm.com no devolvió URL de video. Keys disponibles: {list(result.keys())}")
             return None
+
         r = requests.get(video_url, timeout=120)
         r.raise_for_status()
         filename = os.path.join(
