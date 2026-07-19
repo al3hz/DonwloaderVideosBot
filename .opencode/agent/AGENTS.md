@@ -71,15 +71,15 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 ### Environment Variables
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TELEGRAM_TOKEN` | ✅ | — | Bot token de Telegram |
-| `RENDER_EXTERNAL_HOSTNAME` | ❌ | — | URL externa de Render (para webhook) |
-| `ADMIN_IDS` | ❌ | — | IDs de Telegram separados por coma para `/stats` |
-| `COOKIES_FILE` | ❌ | `<tempdir>/cookies.txt` | Ruta al archivo de cookies |
-| `YDL_CACHE_DIR` | ❌ | `<tempdir>/ydl_cache` | Directorio para caché de extractores de yt-dlp |
-| `MAX_URLS_PER_MESSAGE` | ❌ | `20` | Máximo de URLs permitidas por mensaje |
-| `PORT` | ❌ | `8080` | Puerto del servidor Flask |
+| Variable                   | Required | Default                 | Description                                      |
+| -------------------------- | -------- | ----------------------- | ------------------------------------------------ |
+| `TELEGRAM_TOKEN`           | ✅       | —                       | Bot token de Telegram                            |
+| `RENDER_EXTERNAL_HOSTNAME` | ❌       | —                       | URL externa de Render (para webhook)             |
+| `ADMIN_IDS`                | ❌       | —                       | IDs de Telegram separados por coma para `/stats` |
+| `COOKIES_FILE`             | ❌       | `<tempdir>/cookies.txt` | Ruta al archivo de cookies                       |
+| `YDL_CACHE_DIR`            | ❌       | `<tempdir>/ydl_cache`   | Directorio para caché de extractores de yt-dlp   |
+| `MAX_URLS_PER_MESSAGE`     | ❌       | `20`                    | Máximo de URLs permitidas por mensaje            |
+| `PORT`                     | ❌       | `8080`                  | Puerto del servidor Flask                        |
 
 ---
 
@@ -88,7 +88,6 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 - **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes or `yt-dlp` invocations) using `loop.run_in_executor()` with `_download_executor`.
 - **Conciseness:** Provide direct code updates. When modifying `main.py`, output the specific changed function or block rather than rewriting the entire file, unless explicitly requested.
 - **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish.
-- **Sync AGENTS.md on every change:** Every integration, change, new feature, or flow modification **must** be documented immediately in this `AGENTS.md`. This file must always reflect the exact current state of the project. No functionality change is complete until `AGENTS.md` is updated accordingly.
 - **Logging Required:** Every function must include logs (`logging.info`, `logging.warning`, `logging.error`) to record its entry, key decisions, and errors. This allows tracking the bot's flow and diagnosing issues without debugging in production.
 - **Thread safety:** Global mutable state (`_stats`, `_user_queues`, `_queue_workers`) must be protected. Use `threading.Lock` for dict/set mutations accessed from multiple threads.
 - **Download handler pattern:** `download_video` is a thin handler that validates + enqueues. The actual download logic lives in `_execute_download`. Errors in `_execute_download` are caught by `_queue_worker` which handles user-friendly error messages and metric tracking.
@@ -100,13 +99,17 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 Before submitting any change to the codebase, the agent MUST follow this protocol:
 
 ### 1. Test Every Function
+
 Every new or modified function must be tested by running the code locally via Python:
+
 - Run `python -c "import ast; ast.parse(open('main.py', encoding='utf-8').read())"` to verify syntax.
 - Verify all imports work (`python -c "import yt_dlp, telegram, flask, requests"`).
 - Ensure no dead code (unused imports, variables, etc.) is left behind.
 
 ### 2. Verify Every User URL
+
 When the user reports an issue with a specific URL:
+
 1. **Test the URL locally** with the exact yt-dlp command used in the bot:
    ```
    yt-dlp --format "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/best" --socket-timeout 120 --merge-output-format mp4 <URL>
@@ -115,16 +118,20 @@ When the user reports an issue with a specific URL:
 3. **Apply a fix** in the bot code if the issue is on our side. If the issue is in yt-dlp or the platform (e.g., Twitter API change, TikTok blocking), **do not silently ignore it** — explain to the user what the limitation is and offer alternatives (e.g., use cookies, update yt-dlp, report upstream).
 
 ### 3. Classify Errors Correctly
+
 - If the error is in **yt-dlp**, `python-telegram-bot`, or another library → explain it clearly and provide workarounds if available.
 - If the error is from the **platform** (Twitter/X, Instagram, TikTok blocking/rate-limiting) → explain the limitation and what the user can do (cookies, retry later, etc.).
 - If the error is a **bug in the bot code** → fix it directly.
 - Never suggest unrelated solutions (e.g., `@botfather` for download issues).
 
 ### 4. Verify Before Deploying
+
 After any code change, run a final syntax and import check before telling the user the fix is ready.
 
 ### 5. Render Compatibility Check
+
 Before deploying any new feature or platform integration to production, verify that it will work in Render's environment:
+
 - **Datacenter IP:** Render uses datacenter IPs. Some platforms (like YouTube) block these IPs. Do not add a platform if it requires a residential IP or cookies to function.
 - **Disk space:** Render has an ephemeral filesystem. Make sure to use `tempfile.gettempdir()` for temporary files (already implemented).
 - **Gunicorn timeout:** The `Procfile` has `--timeout 300`. Any operation exceeding this time must run in the background.
