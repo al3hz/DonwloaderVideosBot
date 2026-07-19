@@ -208,6 +208,50 @@ def _tiktok_api_fallback(url):
         audio_formats = [{"url": music_url, "ext": "mp3"}]
     return (slideshow_formats, audio_formats, images)
 
+
+def _tiktok_video_api_fallback(url):
+    """
+    Fallback para videos de TikTok (contenido sensible / age-restricted)
+    usando la API de tikwm.com. Descarga el video directamente y
+    retorna la ruta del archivo, o None si falla.
+    """
+    logging.info(f"Usando fallback tikwm.com para video TikTok: {url}")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    try:
+        resp = requests.post(
+            "https://tikwm.com/api/",
+            data={"url": url.split("?")[0]},
+            headers=headers,
+            timeout=30,
+        )
+        data = resp.json()
+        if data.get("code") != 0:
+            logging.warning(f"tikwm.com respondió con código {data.get('code')}")
+            return None
+        result = data.get("data", {})
+        # Priorizar video sin marca de agua; si no, usar el que tenga watermark
+        video_url = result.get("video") or result.get("video_with_watermark")
+        if not video_url:
+            logging.warning("tikwm.com no devolvió URL de video")
+            return None
+        r = requests.get(video_url, timeout=120)
+        r.raise_for_status()
+        filename = os.path.join(
+            tempfile.gettempdir(),
+            f"tiktok_video_{int(time.time())}.mp4",
+        )
+        with open(filename, "wb") as f:
+            f.write(r.content)
+        logging.info(f"Video TikTok descargado via tikwm.com: {filename} ({len(r.content)} bytes)")
+        return filename
+    except Exception as e:
+        logging.warning(f"Error en TikTok video fallback: {e}")
+        return None
+
+
 # ============================================================
 # Fallback para Reddit: descarga directa de imágenes/GIFs
 # ============================================================
@@ -955,6 +999,74 @@ async def _execute_download(task: DownloadTask):
                 except Exception:
                     pass
                 return
+            # Si el fallback también falla, propagar el error original
+            raise
+
+    # Para TikTok: si yt-dlp falla (contenido sensible/age-restricted),
+    # probar fallback con tikwm.com
+    if is_tiktok:
+        try:
+            result = await loop.run_in_executor(_download_executor, download)
+        except Exception as e:
+            err_text = str(e)
+            logging.info(f"TikTok: descarga normal falló, probando fallback tikwm.com: {err_text[:200]}")
+
+            tiktok_file = await loop.run_in_executor(
+                _download_executor, _tiktok_video_api_fallback, url
+            )
+
+            if tiktok_file:
+                file_size = os.path.getsize(tiktok_file)
+                if file_size > 50 * 1024 * 1024:
+                    os.remove(tiktok_file)
+                    await bot.edit_message_text(
+                        chat_id=task.chat_id, message_id=task.processing_msg_id,
+                        text="❌ El archivo pesa más de 50 MB."
+                    )
+                    _inc_stats("failed")
+                    return
+
+                # Detectar si el video tiene audio
+                try:
+                    probe = subprocess.run(
+                        ["ffprobe", "-v", "quiet", "-select_streams", "a",
+                         "-show_entries", "stream=codec_type", "-of", "csv=p=0", tiktok_file],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    has_audio = bool(probe.stdout.strip())
+                except Exception:
+                    has_audio = True
+
+                caption = f"📥 Descargado por @{task.bot_username}"
+
+                if has_audio:
+                    await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO)
+                    await _send_file_with_retry(
+                        bot, tiktok_file,
+                        lambda f: bot.send_video(
+                            chat_id=task.chat_id, video=f, caption=caption,
+                            supports_streaming=True,
+                            read_timeout=120, write_timeout=120, connect_timeout=30,
+                        ),
+                    )
+                else:
+                    await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO)
+                    await _send_file_with_retry(
+                        bot, tiktok_file,
+                        lambda f: bot.send_animation(
+                            chat_id=task.chat_id, animation=f, caption=caption,
+                            read_timeout=120, write_timeout=120, connect_timeout=30,
+                        ),
+                    )
+
+                os.remove(tiktok_file)
+                _inc_stats("successful")
+                try:
+                    await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
+                except Exception:
+                    pass
+                return
+
             # Si el fallback también falla, propagar el error original
             raise
 
