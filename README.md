@@ -1,39 +1,56 @@
 # DownloaderVideosBot
 
-Bot de Telegram para descargar videos de **TikTok**, **Instagram Reels**, **Facebook** y **Twitter/X**.
+Bot de Telegram para descargar videos de **TikTok**, **Instagram Reels**, **Facebook**, **Twitter/X** y **Reddit**.
 
-## Cómo usar
+## Como usar
 
-Envía un enlace al bot y este te devolverá el video descargado.
+Envia uno o varios enlaces al bot y los procesara en orden (cola FIFO por usuario).
 
 **Plataformas soportadas:**
-- TikTok (videos y slideshows)
-- Instagram (solo Reels)
-- Facebook (videos / Reels)
-- Twitter / X
 
-**Límite:** 50 MB por archivo (límite de Telegram para bots).
+| Plataforma | Contenido |
+|---|---|
+| TikTok | Videos (sin marca de agua), slideshows, posts de una sola imagen |
+| Instagram | Reels |
+| Facebook | Videos / Reels |
+| Twitter / X | Videos, GIFs |
+| Reddit | Videos (v.redd.it), imagenes, GIFs |
+
+**Limite:** 50 MB por archivo.
+
+**Comandos:**
+
+| Comando | Descripcion |
+|---|---|
+| `/start` | Mensaje de bienvenida |
+| `/stats` | Estadisticas del bot (solo admins) |
+
+## Variables de entorno
+
+| Variable | Requerida | Descripcion |
+|---|---|---|
+| `TELEGRAM_TOKEN` | Si | Token del bot de Telegram |
+| `ADMIN_IDS` | No | IDs de Telegram (separados por coma) para acceder a `/stats` |
+| `PORT` | No | Puerto del servidor (default: 8080) |
+| `RENDER_EXTERNAL_HOSTNAME` | No | Hostname en Render para configurar el webhook |
+| `COOKIES_FILE` | No | Ruta a archivo de cookies en formato Netscape |
+| `YDL_CACHE_DIR` | No | Directorio de cache para yt-dlp |
+| `MAX_URLS_PER_MESSAGE` | No | Maximo de URLs por mensaje (default: 20) |
 
 ## Stack
 
-- Python 3.11+ asyncio
-- python-telegram-bot v22 (webhooks)
-- yt-dlp
+- Python 3.11+
+- python-telegram-bot v21+ (webhooks)
+- yt-dlp (con fallback a tikwm.com para TikTok)
 - Flask + Gunicorn
 - Render
 
 ## Archivos
 
-| Archivo | Descripción |
-|---------|-------------|
+| Archivo | Descripcion |
+|---|---|
 | `main.py` | Bot completo |
 | `Procfile` | Comando de inicio para Render |
 | `requirements.txt` | Dependencias |
-| `runtime.txt` | Versión de Python |
-| `.opencode/agent/AGENTS.md` | Instrucciones para IA |
-
-## AGENTS.md
-
-Este proyecto incluye un archivo `.opencode/agent/AGENTS.md` con instrucciones detalladas para que una IA (como opencode o Claude) pueda entender, mantener y mejorar el código correctamente. Incluye el stack, flujo de trabajo, reglas de configuración, estándares de código y un protocolo de verificación.
-
-Si usas una IA para trabajar en este proyecto, asígnala a `.opencode/agent/AGENTS.md` primero.
+| `runtime.txt` | Version de Python |
+| `env_example.env` | Plantilla de variables de entorno |

@@ -806,59 +806,22 @@ async def _execute_download(task: DownloadTask) -> None:
     loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
     # ================================================================
-    # Deteccion y manejo de TikTok slideshows (solo /photo/)
+    # Deteccion de TikTok slideshows / posts de una sola imagen
     # ================================================================
     if is_tiktok:
         logger.info(f"URL de TikTok detectada: {url}")
-        clean_url: str = url.split("?")[0]
-        is_photo_url: bool = "/photo/" in clean_url
 
-        # Solo hacer pre-deteccion para URLs /photo/.
-        # Para URLs normales (/video/) se va directo a download() para evitar
-        # 2 HTTP round-trips extra (extract_info + tikwm API) que causan lentitud.
-        if is_photo_url:
-            clean_url = clean_url.replace("/photo/", "/video/")
-            logger.info(f"URL convertida para slideshow: {clean_url}")
-
-            def try_ydl() -> dict:
-                logger.debug("try_ydl: extrayendo info via yt-dlp")
-                with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-                    return ydl.extract_info(clean_url, download=False)
-
-            slideshow_data: Optional[tuple] = None
-            try:
-                info: dict = await loop.run_in_executor(_download_executor, try_ydl)
-                formats: list = info.get("formats", [])
-                slideshow_formats: list = [
-                    f for f in formats
-                    if f.get("format_id", "").startswith("slideshow-")
-                ]
-                if slideshow_formats:
-                    audio_formats: list = [
-                        f for f in formats
-                        if f.get("vcodec") == "none" and f.get("acodec", "none") != "none"
-                    ]
-                    slideshow_data = (slideshow_formats, audio_formats, None)
-                    logger.info(
-                        f"Slideshow detectado via yt-dlp: {len(slideshow_formats)} slides"
-                    )
-            except Exception as e:
-                logger.warning(f"yt-dlp fallo detectando slideshow: {e}")
-
-            if not slideshow_data:
-                try:
-                    api_data: Optional[tuple] = await loop.run_in_executor(
-                        _download_executor, _tiktok_api_fallback, url
-                    )
-                    if api_data:
-                        slideshow_data = api_data
-                except Exception as e:
-                    logger.warning(f"Fallback tikwm tambien fallo: {e}")
-
-            if slideshow_data:
-                slideshow_formats, _audio_formats, api_images = slideshow_data
+        # tikwm.com detecta correctamente tanto /photo/ como posts
+        # de una sola imagen con /video/ en la URL (que yt-dlp no detecta).
+        # Es un solo HTTP POST, mucho mas rapido que yt-dlp extract_info.
+        try:
+            api_data: Optional[tuple] = await loop.run_in_executor(
+                _download_executor, _tiktok_api_fallback, url
+            )
+            if api_data:
+                slideshow_formats, _audio_formats, api_images = api_data
                 logger.info(
-                    f"Procesando slideshow con {len(slideshow_formats)} imagenes"
+                    f"Slideshow detectado via tikwm: {len(slideshow_formats)} imagenes"
                 )
 
                 def dl_slideshow() -> list[str]:
@@ -933,6 +896,8 @@ async def _execute_download(task: DownloadTask) -> None:
 
                 _inc_stats("successful")
                 return
+        except Exception as e:
+            logger.debug(f"tikwm check: no es slideshow ({e})")
 
     # ================================================================
     # Descarga normal con yt-dlp
@@ -1026,6 +991,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         bot, img_filename,
                         lambda f: bot.send_animation(
                             chat_id=task.chat_id, animation=f, caption=caption,
+                            reply_to_message_id=task.message_id,
                             read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT,
                         ),
                     )
@@ -1035,6 +1001,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         bot, img_filename,
                         lambda f: bot.send_photo(
                             chat_id=task.chat_id, photo=f, caption=caption,
+                            reply_to_message_id=task.message_id,
                             read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT,
                         ),
                     )
@@ -1088,6 +1055,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     lambda f: bot.send_video(
                         chat_id=task.chat_id, video=f, caption=caption,
                         supports_streaming=True,
+                        reply_to_message_id=task.message_id,
                         read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT,
                     ),
                 )
@@ -1142,6 +1110,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 chat_id=task.chat_id,
                 animation=f,
                 caption=caption,
+                reply_to_message_id=task.message_id,
                 read_timeout=TG_READ_TIMEOUT,
                 write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
@@ -1158,6 +1127,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 caption=caption,
                 duration=duration if duration else None,
                 supports_streaming=True,
+                reply_to_message_id=task.message_id,
                 read_timeout=TG_READ_TIMEOUT,
                 write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
@@ -1172,6 +1142,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 chat_id=task.chat_id,
                 photo=f,
                 caption=caption,
+                reply_to_message_id=task.message_id,
                 read_timeout=TG_READ_TIMEOUT,
                 write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
