@@ -188,8 +188,10 @@ def get_ydl_opts() -> dict:
         # best[filesize<50M] primero: formato combinado con audio (esencial para IG Reels).
         # Luego bestvideo+bestaudio (merge DASH), luego fallback a cualquier best.
         "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/bestvideo+bestaudio/best",
-        "format_sort": ["hasaud"],  # preferir formatos con audio sobre los que no
-        "outtmpl": os.path.join(tempfile.gettempdir(), "%(id)s.%(ext)s"),
+        # Preferir codecs compatibles con WhatsApp y la mayoria de reproductores:
+        # H.264 (vcodec) + AAC (acodec) en contenedor MP4.
+        # Si no hay H.264 disponible, cae a lo que haya.
+        "format_sort": ["vcodec:h264", "acodec:aac", "hasaud", "res", "fps"],
         "merge_output_format": "mp4",
         "socket_timeout": SOCKET_TIMEOUT,
         "extractor_retries": 3,
