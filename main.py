@@ -1342,6 +1342,13 @@ def health():
     errores 5xx consecutivos, asi que no usamos 503 como "not ready").
     El estado real del bot va en el campo `bot_ready`.
     """
+    # Bootstrap lazy DESDE el worker (NO en import: gunicorn corre con --preload
+    # y el import/init del master se hereda roto en los workers forkeados).
+    # Fire-and-forget para no bloquear el health check. ensure_bot es
+    # idempotente y thread-safe, asi que varios triggers son seguros.
+    if not _bot_ready:
+        threading.Thread(target=ensure_bot, daemon=True).start()
+
     try:
         yt_ver: str = getattr(yt_dlp.version, "__version__", str(yt_dlp.version))
     except Exception:
@@ -1368,7 +1375,3 @@ def health():
 if __name__ == "__main__":
     logger.info(f"Iniciando servidor en puerto {PORT}")
     app.run(host="0.0.0.0", port=PORT)
-elif not _bot_ready:
-    # Bajo gunicorn: bootstrap temprano (fire-and-forget) para configurar el
-    # webhook con secret_token apenas bootea, sin esperar el primer update.
-    threading.Thread(target=ensure_bot, daemon=True).start()
