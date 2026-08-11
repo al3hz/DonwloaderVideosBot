@@ -1260,8 +1260,20 @@ async def _init_bot() -> None:
         logger.info(f"Webhook configurado en {webhook_url}")
 
 
+def _bot_loop_thread(loop: asyncio.AbstractEventLoop) -> None:
+    """Thread daemon que corre el event loop unico del bot durante toda la vida del proceso."""
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
+
+
 def ensure_bot() -> bool:
-    """Asegura que el bot este inicializado (thread-safe)."""
+    """Asegura que el bot este inicializado (thread-safe, idempotente).
+
+    Usa SIEMPRE el mismo event loop (thread daemon persistente). Si se creara un
+    loop nuevo en cada reintento, el cliente HTTPX de la Application quedaria
+    atado al loop del primer intento y los siguientes fallarian con
+    "bound to a different event loop".
+    """
     global _bot_loop, _bot_ready
     if _bot_ready:
         return True
@@ -1269,11 +1281,15 @@ def ensure_bot() -> bool:
         if _bot_ready:
             return True
         try:
-            loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
-            loop.run_until_complete(_init_bot())
-            _bot_loop = loop
-            t: threading.Thread = threading.Thread(target=_bot_loop.run_forever, daemon=True)
-            t.start()
+            if _bot_loop is None:
+                loop: asyncio.AbstractEventLoop = asyncio.new_event_loop()
+                _bot_loop = loop
+                t: threading.Thread = threading.Thread(
+                    target=_bot_loop_thread, args=(loop,), daemon=True
+                )
+                t.start()
+            future = asyncio.run_coroutine_threadsafe(_init_bot(), _bot_loop)
+            future.result(timeout=60)
             _bot_ready = True
             logger.info("Bot inicializado correctamente")
             return True
@@ -1299,13 +1315,17 @@ def ensure_bot() -> bool:
 def webhook():
     """Recibe y procesa las actualizaciones de Telegram via webhook."""
     logger.debug("Webhook recibido")
+    # ensure_bot() DEBE correr antes del check del secret: si el webhook en
+    # Telegram es de una config vieja (sin secret), el primer update llega sin
+    # el header y este bootstrap lo usa para re-configurar set_webhook() con el
+    # secret. Asi Telegram reintenta ese mismo update YA con el header y pasa.
+    if not ensure_bot():
+        return "Bot not ready", 503
     if WEBHOOK_SECRET:
         token_header: Optional[str] = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if token_header != WEBHOOK_SECRET:
             logger.warning("Webhook rechazado: secret_token invalido")
             return "Forbidden", 403
-    if not ensure_bot():
-        return "Bot not ready", 503
     update: Update = Update.de_json(request.get_json(force=True), application.bot)
     asyncio.run_coroutine_threadsafe(
         application.process_update(update), _bot_loop
@@ -1348,3 +1368,7 @@ def health():
 if __name__ == "__main__":
     logger.info(f"Iniciando servidor en puerto {PORT}")
     app.run(host="0.0.0.0", port=PORT)
+elif not _bot_ready:
+    # Bajo gunicorn: bootstrap temprano (fire-and-forget) para configurar el
+    # webhook con secret_token apenas bootea, sin esperar el primer update.
+    threading.Thread(target=ensure_bot, daemon=True).start()
