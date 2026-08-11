@@ -29,6 +29,7 @@ Envia uno o varios enlaces al bot y los procesara en orden (cola FIFO por usuari
 | Variable | Requerida | Descripcion |
 |---|---|---|
 | `TELEGRAM_TOKEN` | Si | Token del bot de Telegram |
+| `TELEGRAM_WEBHOOK_SECRET` | No | Secreto para validar el webhook (header `X-Telegram-Bot-Api-Secret-Token`). Recomendado en produccion |
 | `ADMIN_IDS` | No | IDs de Telegram (separados por coma) para acceder a `/stats` |
 | `PORT` | No | Puerto del servidor (default: 8080) |
 | `RENDER_EXTERNAL_HOSTNAME` | No | Hostname en Render para configurar el webhook |
@@ -43,6 +44,23 @@ Envia uno o varios enlaces al bot y los procesara en orden (cola FIFO por usuari
 - yt-dlp (con fallback a tikwm.com para TikTok)
 - Flask + Gunicorn
 - Render
+
+## Despliegue en Render
+
+**Build Command** (en el dashboard o en `render.yaml`):
+
+```
+pip install -r requirements.txt && pip install -U --force-reinstall https://github.com/yt-dlp/yt-dlp/archive/master.tar.gz
+```
+
+**Start Command** (auto: `Procfile`): `gunicorn main:app --bind 0.0.0.0:$PORT --workers 1 --threads 2 --timeout 300 --keep-alive 5`
+
+**Health Check Path:** `/health` (siempre responde 200 mientras el proceso viva; `bot_ready` indica si el bot esta listo).
+
+**Variables extra:** `TELEGRAM_WEBHOOK_SECRET` (valor secreto para proteger el webhook).
+
+> Nota: el yt-dlp nightly/master se instala en el **Build**, no en el start. Asi no retrasa
+> el readiness en cada deploy/restart/spin-up y el free tier no quema horas innecesariamente.
 
 ## Archivos
 

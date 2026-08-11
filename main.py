@@ -1,7 +1,6 @@
 import os
 import time
 import asyncio
-import signal
 import threading
 import tempfile
 import logging
@@ -17,6 +16,7 @@ from telegram import Update, InputMediaPhoto, Message
 from telegram.constants import ChatAction
 from telegram.error import TimedOut as TelegramTimedOut, NetworkError as TelegramNetworkError
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.request import HTTPXRequest
 import yt_dlp
 import requests
 
@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 TOKEN: Optional[str] = os.environ.get("TELEGRAM_TOKEN")
 if not TOKEN:
     raise RuntimeError("TELEGRAM_TOKEN no esta configurado en las variables de entorno")
+
+WEBHOOK_SECRET: Optional[str] = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
 PORT: int = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL: Optional[str] = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
@@ -56,6 +58,7 @@ USER_COOLDOWN_SECONDS: float = 15.0    # cooldown minimo entre batches por usuar
 TG_READ_TIMEOUT: int = 120
 TG_WRITE_TIMEOUT: int = 120
 TG_CONNECT_TIMEOUT: int = 30
+TG_MEDIA_WRITE_TIMEOUT: int = 300   # uploads grandes (hasta 50MB) necesitan mas margen
 
 # ============================================================
 # Estadisticas globales (thread-safe)
@@ -97,6 +100,28 @@ def _check_cooldown(user_id: int) -> float:
         return 0
 
 # ============================================================
+# Chat action throttled (send_chat_action)
+# ============================================================
+# Telegram solo mantiene el estado "typing/subiendo" ~5s por request.
+# Llamarlo sin control quema requests de la API sin beneficio para el usuario.
+_chat_action_last_sent: dict[int, float] = {}
+_chat_action_lock: threading.Lock = threading.Lock()
+CHAT_ACTION_INTERVAL: float = 4.5
+
+async def _send_chat_action(bot, chat_id: int, action) -> None:
+    """Envia send_chat_action con throttle por chat (max 1 cada ~4.5s)."""
+    with _chat_action_lock:
+        now = time.time()
+        last = _chat_action_last_sent.get(chat_id, 0)
+        if now - last < CHAT_ACTION_INTERVAL:
+            return
+        _chat_action_last_sent[chat_id] = now
+    try:
+        await bot.send_chat_action(chat_id=chat_id, action=action)
+    except (TelegramTimedOut, TelegramNetworkError):
+        pass
+
+# ============================================================
 # Cola de descargas por usuario (FIFO)
 # ============================================================
 @dataclass
@@ -122,7 +147,16 @@ _download_executor: concurrent.futures.ThreadPoolExecutor = concurrent.futures.T
     max_workers=2, thread_name_prefix="download"
 )
 
-application: Application = Application.builder().token(TOKEN).build()
+_tg_request: HTTPXRequest = HTTPXRequest(
+    connect_timeout=TG_CONNECT_TIMEOUT,
+    read_timeout=TG_READ_TIMEOUT,
+    write_timeout=TG_WRITE_TIMEOUT,
+    media_write_timeout=TG_MEDIA_WRITE_TIMEOUT,
+    pool_timeout=30,
+    connection_pool_size=256,
+)
+
+application: Application = Application.builder().token(TOKEN).request(_tg_request).build()
 
 # ============================================================
 # Handlers de comandos
@@ -196,10 +230,24 @@ def get_ydl_opts() -> dict:
         "extractor_retries": 3,
         "file_access_retries": 3,
         "retries": 5,
-        "retry_sleep": "linear=1:5",
+        "retry_sleep": {"extractor": "linear=1:5"},
         "concurrent_fragments": 3,
         "check_formats": True,
         "ratelimit": 10 * 1024 * 1024,
+        "noplaylist": True,
+        "trim_filenames": 180,
+        # Anti-429: pausa de 1s entre requests de info para Twitter/TikTok/etc.
+        "sleep_interval_requests": 1,
+        # Impersonate solo para el extractor generico (Facebook links via Cloudflare).
+        # Se deja OFF globalmente: forzarlo en todo reduce velocidad y estabilidad.
+        "extractor_args": {
+            "generic": {"impersonate": ["chrome"]},
+            "tiktok": {
+                "app_version": ["35.1.3"],
+                "manifest_app_version": ["2023501030"],
+                "app_name": ["musical_ly"],
+            },
+        },
         "embedthumbnail": True,
         "quiet": True,
         "no_warnings": True,
@@ -975,7 +1023,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 ext: str = os.path.splitext(img_filename)[1].lower()
                 caption: str = f"\U0001f4e5 Descargado por @{task.bot_username}"
                 if ext == ".gif":
-                    await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO)
+                    await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_VIDEO)
                     await _send_file_with_retry(
                         bot, img_filename,
                         lambda f: bot.send_animation(
@@ -985,7 +1033,18 @@ async def _execute_download(task: DownloadTask) -> None:
                         ),
                     )
                 else:
-                    await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO)
+                    if file_size > 10 * 1024 * 1024:
+                        try:
+                            os.remove(img_filename)
+                        except OSError:
+                            pass
+                        await bot.edit_message_text(
+                            chat_id=task.chat_id, message_id=task.processing_msg_id,
+                            text="\u274c La imagen pesa mas de 10 MB y Telegram no puede enviarla."
+                        )
+                        _inc_stats("failed")
+                        return
+                    await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
                     await _send_file_with_retry(
                         bot, img_filename,
                         lambda f: bot.send_photo(
@@ -1038,7 +1097,7 @@ async def _execute_download(task: DownloadTask) -> None:
 
                 # send_video funciona con y sin audio en todos los clientes (mobile incluido).
                 # send_animation con MP4 causa "formato invalido" al guardar en moviles.
-                await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO)
+                await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_VIDEO)
                 await _send_file_with_retry(
                     bot, tiktok_file,
                     lambda f: bot.send_video(
@@ -1092,7 +1151,7 @@ async def _execute_download(task: DownloadTask) -> None:
     # Para MP4/webm sin audio usamos send_video que funciona en todos los clientes
     # y evita "formato invalido" al guardar en moviles.
     if file_ext == ".gif":
-        await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO)
+        await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_VIDEO)
         await _send_file_with_retry(
             bot, filename,
             lambda f: bot.send_animation(
@@ -1107,7 +1166,7 @@ async def _execute_download(task: DownloadTask) -> None:
         )
         logger.info(f"GIF enviado: {filename}")
     elif is_video:
-        await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_VIDEO)
+        await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_VIDEO)
         await _send_file_with_retry(
             bot, filename,
             lambda f: bot.send_video(
@@ -1124,7 +1183,20 @@ async def _execute_download(task: DownloadTask) -> None:
         )
         logger.info(f"Video enviado: {filename}")
     else:
-        await bot.send_chat_action(chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO)
+        if file_size > 10 * 1024 * 1024:
+            logger.warning(f"Foto excede 10MB, no se puede enviar: {filename}")
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+            await bot.edit_message_text(
+                chat_id=task.chat_id,
+                message_id=task.processing_msg_id,
+                text="\u274c La imagen pesa mas de 10 MB y Telegram no puede enviarla.",
+            )
+            _inc_stats("failed")
+            return
+        await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
         await _send_file_with_retry(
             bot, filename,
             lambda f: bot.send_photo(
@@ -1178,7 +1250,13 @@ async def _init_bot() -> None:
     await application.start()
     if RENDER_EXTERNAL_URL:
         webhook_url: str = f"https://{RENDER_EXTERNAL_URL}/webhook"
-        await application.bot.set_webhook(url=webhook_url)
+        await application.bot.set_webhook(
+            url=webhook_url,
+            secret_token=WEBHOOK_SECRET,
+            allowed_updates=["message"],
+            max_connections=40,
+            drop_pending_updates=True,
+        )
         logger.info(f"Webhook configurado en {webhook_url}")
 
 
@@ -1207,40 +1285,11 @@ def ensure_bot() -> bool:
 # ============================================================
 # Shutdown graceful
 # ============================================================
-
-def _shutdown() -> None:
-    """Apaga el bot y limpia recursos de forma ordenada."""
-    logger.info("Iniciando shutdown graceful...")
-
-    # 1. Cancelar workers activos
-    for user_id, worker in list(_queue_workers.items()):
-        if not worker.done():
-            worker.cancel()
-        logger.info(f"Worker cancelado para usuario {user_id}")
-    _queue_workers.clear()
-    _user_queues.clear()
-
-    # 2. Apagar el executor de descargas
-    _download_executor.shutdown(wait=True, cancel_futures=True)
-    logger.info("Executor de descargas apagado")
-
-    # 3. Detener el bot de Telegram
-    if _bot_loop and _bot_loop.is_running():
-        _bot_loop.call_soon_threadsafe(_bot_loop.stop)
-    logger.info("Event loop del bot detenido")
-
-    logger.info("Shutdown graceful completado")
-
-
-def _signal_handler(signum: int, frame) -> None:
-    """Manejador de senales para iniciar shutdown graceful."""
-    logger.info(f"Senal {signum} recibida, iniciando shutdown...")
-    _shutdown()
-    os._exit(0)
-
-
-signal.signal(signal.SIGTERM, _signal_handler)
-signal.signal(signal.SIGINT, _signal_handler)
+# NOTA: El manejo de SIGTERM lo deja gestionar a gunicorn (worker lifecycle).
+# El ThreadPoolExecutor se autolimpia en el exit del interprete via el atexit
+# de concurrent.futures, y el event loop del bot corre en un thread daemon que
+# muere con el proceso. Un handler propio con executor.shutdown(wait=True) + 
+# os._exit(0) bloqueaba o cortaba requests en vuelo durante los restarts.
 
 # ============================================================
 # Endpoints de Flask
@@ -1250,6 +1299,11 @@ signal.signal(signal.SIGINT, _signal_handler)
 def webhook():
     """Recibe y procesa las actualizaciones de Telegram via webhook."""
     logger.debug("Webhook recibido")
+    if WEBHOOK_SECRET:
+        token_header: Optional[str] = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if token_header != WEBHOOK_SECRET:
+            logger.warning("Webhook rechazado: secret_token invalido")
+            return "Forbidden", 403
     if not ensure_bot():
         return "Bot not ready", 503
     update: Update = Update.de_json(request.get_json(force=True), application.bot)
@@ -1263,20 +1317,18 @@ def webhook():
 @app.route("/health")
 def health():
     """
-    Endpoint de salud mejorado.
-    Retorna JSON con el estado del bot, version de yt-dlp e info de colas activas.
+    Endpoint de salud.
+    Siempre responde 200 mientras el proceso este vivo (Render reinicia tras
+    errores 5xx consecutivos, asi que no usamos 503 como "not ready").
+    El estado real del bot va en el campo `bot_ready`.
     """
-    if not _bot_ready:
-        logger.warning("Health check: bot no listo")
-        return jsonify({"status": "error", "message": "Bot not ready"}), 503
-
     try:
         yt_ver: str = getattr(yt_dlp.version, "__version__", str(yt_dlp.version))
     except Exception:
         yt_ver = "unknown"
 
     health_data: dict = {
-        "status": "ok",
+        "status": "ok" if _bot_ready else "starting",
         "yt_dlp_version": yt_ver,
         "bot_ready": _bot_ready,
         "queues": {
