@@ -235,6 +235,10 @@ def get_ydl_opts() -> dict:
         "check_formats": True,
         "ratelimit": 10 * 1024 * 1024,
         "noplaylist": True,
+        # Truncar el titulo por BYTES (no caracteres): un titulo CJK de 180
+        # caracteres = ~540 bytes y excede el limite de 255 bytes del filesystem
+        # (ENAMETOOLONG). 100 bytes + sufijo queda siempre por debajo de 255.
+        "outtmpl": "%(title).100B [%(id)s].%(ext)s",
         "trim_filenames": 180,
         # Anti-429: pausa de 1s entre requests de info para Twitter/TikTok/etc.
         "sleep_interval_requests": 1,
@@ -344,6 +348,11 @@ def _tiktok_video_api_fallback(url: str) -> Optional[str]:
             return None
 
         result: dict = data.get("data", {})
+        if result.get("images"):
+            logger.warning(
+                "tikwm.com devolvio un slideshow, no un video — se omite el fallback"
+            )
+            return None
         video_url: Optional[str] = (
             result.get("play")
             or result.get("video")
@@ -851,90 +860,108 @@ async def _execute_download(task: DownloadTask) -> None:
         # tikwm.com detecta correctamente tanto /photo/ como posts
         # de una sola imagen con /video/ en la URL (que yt-dlp no detecta).
         # Es un solo HTTP POST, mucho mas rapido que yt-dlp extract_info.
+        api_data: Optional[tuple] = None
         try:
-            api_data: Optional[tuple] = await loop.run_in_executor(
+            api_data = await loop.run_in_executor(
                 _download_executor, _tiktok_api_fallback, url
             )
-            if api_data:
-                slideshow_formats, _audio_formats, api_images = api_data
-                logger.info(
-                    f"Slideshow detectado via tikwm: {len(slideshow_formats)} imagenes"
+        except Exception as e:
+            logger.warning(f"tikwm check fallo: {e}")
+
+        if api_data:
+            slideshow_formats, _audio_formats, api_images = api_data
+            logger.info(
+                f"Slideshow detectado via tikwm: {len(slideshow_formats)} imagenes"
+            )
+
+            def dl_slideshow() -> list[str]:
+                logger.debug("dl_slideshow: descargando imagenes")
+                paths: list[str] = []
+                targets: list = (
+                    api_images
+                    if api_images
+                    else [sf.get("url") for sf in slideshow_formats]
                 )
-
-                def dl_slideshow() -> list[str]:
-                    logger.debug("dl_slideshow: descargando imagenes")
-                    paths: list[str] = []
-                    targets: list = (
-                        api_images
-                        if api_images
-                        else [sf.get("url") for sf in slideshow_formats]
+                dl_headers: dict = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Referer": "https://www.tiktok.com/",
+                }
+                for i, img_url in enumerate(targets):
+                    if not img_url:
+                        continue
+                    path: str = os.path.join(
+                        tempfile.gettempdir(),
+                        f"tiktok_slide_{int(time.time())}_{i}.jpg",
                     )
-                    for i, img_url in enumerate(targets):
-                        if not img_url:
-                            continue
-                        path: str = os.path.join(
-                            tempfile.gettempdir(),
-                            f"tiktok_slide_{int(time.time())}_{i}.jpg",
-                        )
-                        r = requests.get(img_url, timeout=HTTP_LONG_TIMEOUT)
-                        r.raise_for_status()
-                        with open(path, "wb") as f:
-                            f.write(r.content)
-                        paths.append(path)
-                    return paths
-
-                img_paths: list[str] = await loop.run_in_executor(_download_executor, dl_slideshow)
-                if not img_paths:
-                    await bot.edit_message_text(
-                        chat_id=task.chat_id,
-                        message_id=task.processing_msg_id,
-                        text="\u274c No se pudieron descargar las imagenes.",
-                    )
-                    _inc_stats("failed")
-                    return
-
-                await bot.send_chat_action(
-                    chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO
-                )
-                caption_text: str = f"\U0001f4e5 Descargado por @{task.bot_username}"
-                for batch_start in range(0, len(img_paths), 10):
-                    batch: list[str] = img_paths[batch_start : batch_start + 10]
-                    media_group: list[InputMediaPhoto] = []
-                    files: list = []
-                    for i, path in enumerate(batch):
-                        f = open(path, "rb")
-                        files.append(f)
-                        if batch_start == 0 and i == 0:
-                            media_group.append(
-                                InputMediaPhoto(f, caption=caption_text)
+                    for attempt in range(1, 4):
+                        try:
+                            r = requests.get(
+                                img_url, headers=dl_headers,
+                                timeout=HTTP_LONG_TIMEOUT,
                             )
-                        else:
-                            media_group.append(InputMediaPhoto(f))
-                    await bot.send_media_group(
-                        chat_id=task.chat_id,
-                        media=media_group,
-                        reply_to_message_id=task.message_id,
-                    )
-                    for f in files:
-                        f.close()
+                            r.raise_for_status()
+                            with open(path, "wb") as f:
+                                f.write(r.content)
+                            paths.append(path)
+                            break
+                        except Exception as e:
+                            logger.warning(
+                                f"Imagen {i} intento {attempt}/3 fallo: {e}"
+                            )
+                            if attempt < 3:
+                                time.sleep(1)
+                return paths
 
-                for p in img_paths:
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+            img_paths: list[str] = await loop.run_in_executor(_download_executor, dl_slideshow)
+            if not img_paths:
+                await bot.edit_message_text(
+                    chat_id=task.chat_id,
+                    message_id=task.processing_msg_id,
+                    text="\u274c No se pudieron descargar las imagenes del slideshow.",
+                )
+                _inc_stats("failed")
+                return
 
+            await bot.send_chat_action(
+                chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO
+            )
+            caption_text: str = f"\U0001f4e5 Descargado por @{task.bot_username}"
+            for batch_start in range(0, len(img_paths), 10):
+                batch: list[str] = img_paths[batch_start : batch_start + 10]
+                media_group: list[InputMediaPhoto] = []
+                files: list = []
+                for i, path in enumerate(batch):
+                    f = open(path, "rb")
+                    files.append(f)
+                    if batch_start == 0 and i == 0:
+                        media_group.append(
+                            InputMediaPhoto(f, caption=caption_text)
+                        )
+                    else:
+                        media_group.append(InputMediaPhoto(f))
+                await bot.send_media_group(
+                    chat_id=task.chat_id,
+                    media=media_group,
+                    reply_to_message_id=task.message_id,
+                )
+                for f in files:
+                    f.close()
+
+            for p in img_paths:
                 try:
-                    await bot.delete_message(
-                        chat_id=task.chat_id, message_id=task.processing_msg_id
-                    )
-                except Exception:
+                    os.remove(p)
+                except OSError:
                     pass
 
-                _inc_stats("successful")
-                return
-        except Exception as e:
-            logger.debug(f"tikwm check: no es slideshow ({e})")
+            try:
+                await bot.delete_message(
+                    chat_id=task.chat_id, message_id=task.processing_msg_id
+                )
+            except Exception:
+                pass
+
+            _inc_stats("successful")
+            return
 
     # ================================================================
     # Descarga normal con yt-dlp

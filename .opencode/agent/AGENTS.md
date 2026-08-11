@@ -45,7 +45,8 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 - `check_formats`: `True` (verifies formats are actually accessible before downloading, reducing mid-download failures).
 - `ratelimit`: `10 * 1024 * 1024` (10 MB/s max to avoid saturating Render's shared bandwidth).
 - `noplaylist`: `True` (evita galerias multiples en Reddit).
-- `trim_filenames`: `180` (evita "File name too long" con titulos largos).
+- `outtmpl`: `"%(title).100B [%(id)s].%(ext)s"` (trunca el titulo por BYTES, no caracteres: un titulo CJK de 180 caracteres = ~540 bytes y excede el limite de 255 bytes del filesystem -> ENAMETOOLONG. 100 bytes + sufijo queda siempre < 255).
+- `trim_filenames`: `180` (respaldo adicional contra "File name too long").
 - `sleep_interval_requests`: `1` (pausa de 1s entre requests de info: anti-429 en Twitter/TikTok).
 - `extractor_args`: `{"generic": {"impersonate": ["chrome"]}, "tiktok": {"app_version": ["35.1.3"], "manifest_app_version": ["2023501030"], "app_name": ["musical_ly"]}}`.
 - `embedthumbnail`: `True` (best-effort embedding of thumbnail into the video as cover art via ffmpeg).
