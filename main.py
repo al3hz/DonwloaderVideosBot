@@ -37,7 +37,7 @@ PORT: int = int(os.environ.get("PORT", 8080))
 RENDER_EXTERNAL_URL: Optional[str] = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 ADMIN_IDS: list[int] = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
-ALLOWED_DOMAINS: list[str] = ["tiktok.com", "instagram.com", "twitter.com", "x.com", "facebook.com", "fb.com", "reddit.com", "redd.it"]
+ALLOWED_DOMAINS: list[str] = ["tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.com", "reddit.com", "redd.it"]
 COOKIES_FILE: str = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR: str = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
 MAX_URLS_PER_MESSAGE: int = int(os.environ.get("MAX_URLS_PER_MESSAGE", 20))
@@ -136,7 +136,6 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "\U0001f44b \u00a1Hola! Soy tu bot de descargas.\n\n"
         "\U0001f4ce **Enviame un enlace** de:\n"
         "\u2022 TikTok (sin marca de agua)\n"
-        "\u2022 Instagram (Reels)\n"
         "\u2022 Facebook (videos / Reels)\n"
         "\u2022 Twitter / X (Videos / GIF)\n"
         "\u2022 Reddit (videos, imagenes y GIFs)\n\n"
@@ -185,7 +184,7 @@ def get_ydl_opts() -> dict:
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     opts: dict = {
-        # best[filesize<50M] primero: formato combinado con audio (esencial para IG Reels).
+        # best[filesize<50M] primero: formato combinado con audio.
         # Luego bestvideo+bestaudio (merge DASH), luego fallback a cualquier best.
         "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/bestvideo+bestaudio/best",
         # Preferir codecs compatibles con WhatsApp y la mayoria de reproductores:
@@ -554,7 +553,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not valid_urls:
         await update.message.reply_text(
             "\u274c No encontre enlaces validos para descargar.\n"
-            "Acepto URLs de: TikTok, Instagram Reels, Facebook, Twitter/X y Reddit."
+            "Acepto URLs de: TikTok, Facebook, Twitter/X y Reddit."
         )
         return
 
@@ -672,13 +671,7 @@ async def _queue_worker(user_id: int) -> None:
                     break
 
             if not err_msg.strip() or err_msg.strip() == "(sin mensaje)":
-                if "instagram.com" in url_lower:
-                    display_msg = (
-                        "\u274c No se pudo descargar ese Reel de Instagram.\n"
-                        "Puede ser un video privado, requerir inicio de sesion, "
-                        "o Instagram cambio algo en su sitio. Proba de nuevo mas tarde."
-                    )
-                elif "tiktok.com" in url_lower:
+                if "tiktok.com" in url_lower:
                     display_msg = (
                         "\u274c No se pudo descargar ese video de TikTok.\n"
                         "Puede ser un video privado, requerir inicio de sesion, "
@@ -705,13 +698,7 @@ async def _queue_worker(user_id: int) -> None:
 
             if not str(e).strip():
                 url_lower = task.url.lower()
-                if "instagram.com" in url_lower:
-                    display_msg = (
-                        "\u274c No se pudo descargar ese Reel de Instagram.\n"
-                        "Puede ser un video privado, requerir inicio de sesion, "
-                        "o Instagram cambio algo en su sitio. Proba de nuevo mas tarde."
-                    )
-                elif "tiktok.com" in url_lower:
+                if "tiktok.com" in url_lower:
                     display_msg = (
                         "\u274c No se pudo descargar ese video de TikTok.\n"
                         "Puede ser un video privado, requerir inicio de sesion, "
@@ -1075,7 +1062,7 @@ async def _execute_download(task: DownloadTask) -> None:
 
             raise
 
-    # Instagram / Twitter / Facebook (o Reddit/TikTok cuando download() tuvo exito)
+    # Twitter / Facebook (o Reddit/TikTok cuando download() tuvo exito)
     if not downloaded:
         result = await loop.run_in_executor(_download_executor, download)
 

@@ -1,6 +1,6 @@
 # DownloaderVideosBot
 
-Bot de Telegram para descargar videos de **TikTok**, **Instagram Reels**, **Facebook**, **Twitter/X** y **Reddit**.
+Bot de Telegram para descargar videos de **TikTok**, **Facebook**, **Twitter/X** y **Reddit**.
 
 ## Como usar
 
@@ -11,7 +11,6 @@ Envia uno o varios enlaces al bot y los procesara en orden (cola FIFO por usuari
 | Plataforma | Contenido |
 |---|---|
 | TikTok | Videos (sin marca de agua), slideshows, posts de una sola imagen |
-| Instagram | Reels |
 | Facebook | Videos / Reels |
 | Twitter / X | Videos, GIFs |
 | Reddit | Videos (v.redd.it), imagenes, GIFs |
