@@ -13,7 +13,7 @@ from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify
-from telegram import Update, InputMediaPhoto, Message
+from telegram import Update, InputMediaPhoto, Message, BotCommand
 from telegram.constants import ChatAction
 from telegram.error import (
     TimedOut as TelegramTimedOut,
@@ -90,6 +90,7 @@ _stats: dict = {
     "successful": 0,
     "failed": 0,
     "unique_users": set(),  # set interno, nunca se serializa como JSON
+    "by_platform": {},      # {"tiktok": {"successful": n, "failed": n}, ...}
 }
 _stats_lock: threading.Lock = threading.Lock()
 
@@ -102,6 +103,29 @@ def _add_unique_user(user_id: int) -> None:
     """Registra un usuario unico de forma thread-safe."""
     with _stats_lock:
         _stats["unique_users"].add(user_id)
+
+
+def _platform_of(url: str) -> str:
+    """Devuelve el nombre de plataforma a partir de una URL (para stats)."""
+    u: str = (url or "").lower()
+    if "tiktok.com" in u:
+        return "tiktok"
+    if "twitter.com" in u or "x.com" in u:
+        return "twitter"
+    if "facebook.com" in u or "fb.com" in u:
+        return "facebook"
+    if "reddit.com" in u or "redd.it" in u:
+        return "reddit"
+    return "otro"
+
+
+def _record_result(url: str, success: bool) -> None:
+    """Registra una descarga exitosa/fallida, tanto global como por plataforma."""
+    _inc_stats("successful" if success else "failed")
+    platform: str = _platform_of(url)
+    with _stats_lock:
+        p: dict = _stats["by_platform"].setdefault(platform, {"successful": 0, "failed": 0})
+        p["successful" if success else "failed"] += 1
 
 # ============================================================
 # Rate limiting por usuario
@@ -192,11 +216,11 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "\U0001f4ce **Enviame un enlace** de:\n"
         "\u2022 TikTok (sin marca de agua)\n"
         "\u2022 Facebook (videos / Reels)\n"
-        "\u2022 Twitter / X (Videos / GIF)\n"
+        "\u2022 Twitter / X (videos, GIFs e imagenes)\n"
         "\u2022 Reddit (videos, imagenes y GIFs)\n\n"
         "\U0001f4e6 **Cola por usuario:**\n"
         "Puedes enviar varios enlaces seguidos. Se procesaran en orden.\n"
-        "Usa /cancel para vaciar tu cola de pendientes.\n\n"
+        "Usa /queue para ver tus pendientes y /cancel para vaciar la cola.\n\n"
         "\u26a0\ufe0f Limite: 50 MB por archivo."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -226,6 +250,15 @@ async def stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             f"\U0001f465 **Usuarios unicos:** {len(_stats['unique_users'])}\n"
             f"\U0001f4e6 **Colas activas:** {len(_user_queues)}\n"
         )
+        platform_lines: list[str] = []
+        for name in ("tiktok", "twitter", "facebook", "reddit", "otro"):
+            p = _stats["by_platform"].get(name)
+            if p and (p.get("successful") or p.get("failed")):
+                platform_lines.append(
+                    f"\u2022 {name}: {p.get('successful', 0)}\u2705 / {p.get('failed', 0)}\u274c"
+                )
+        if platform_lines:
+            text += "\n\U0001f4ca **Por plataforma:**\n" + "\n".join(platform_lines)
 
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -262,6 +295,44 @@ async def cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             "Si hay una descarga en curso, se completara igualmente.",
             parse_mode="Markdown",
         )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Alias de /start."""
+    await start(update, context)
+
+
+async def show_id(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra el chat_id y user_id (util para configurar ADMIN_IDS)."""
+    user = update.effective_user
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"\U0001f194 **Tus IDs**\n\n"
+        f"\U0001f464 **User ID:** `{user.id}`\n"
+        f"\U0001f4ac **Chat ID:** `{chat.id}`",
+        parse_mode="Markdown",
+    )
+
+
+async def queue_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra las descargas pendientes del usuario en su cola."""
+    user = update.effective_user
+    queue = _user_queues.get(user.id)
+    # Lectura directa de la deque interna: el event loop es unico y no hay
+    # modificacion concurrente durante la ejecucion de este handler.
+    tasks = list(queue._queue) if queue else []
+    if not tasks:
+        await update.message.reply_text("\U0001f4ed No tienes descargas pendientes en la cola.")
+        return
+    lines: list[str] = []
+    for i, t in enumerate(tasks, 1):
+        url_short: str = t.url if len(t.url) <= 60 else t.url[:57] + "..."
+        lines.append(f"{i}. {url_short}")
+    text: str = (
+        f"\U0001f4e6 **Cola de descargas** ({len(tasks)} pendiente(s)):\n\n"
+        + "\n".join(lines)
+    )
+    await update.message.reply_text(text, disable_web_page_preview=True)
 
 # ============================================================
 # Opciones de yt-dlp
@@ -329,7 +400,8 @@ def _resolve_tiktok_url(url: str) -> str:
     o la URL original limpia si falla.
     """
     parsed = urlparse(url)
-    if parsed.hostname and parsed.hostname.replace("www.", "") == "vt.tiktok.com":
+    short_hosts = ("vt.tiktok.com", "vm.tiktok.com")
+    if parsed.hostname and parsed.hostname.replace("www.", "") in short_hosts:
         try:
             head = requests.head(
                 url, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
@@ -615,13 +687,107 @@ def _reddit_image_fallback(url: str) -> Optional[str]:
 
 
 # ============================================================
+# Extraccion de URLs de mensajes
+# ============================================================
+_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
+
+
+def _extract_urls(text: str) -> list[str]:
+    """Extrae URLs de un mensaje (sueltas o embebidas en texto), sin duplicados."""
+    seen: set[str] = set()
+    urls: list[str] = []
+    for u in _URL_PATTERN.findall(text):
+        u = u.rstrip(".,;:!?)]}>")
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+    return urls
+
+
+# ============================================================
+# Fallback para imagenes de tweets (Twitter/X)
+# ============================================================
+
+def _twitter_images_fallback(url: str) -> Optional[list[str]]:
+    """
+    Fallback para tweets que contienen imagenes en lugar de video.
+    Usa la API publica de fxtwitter/vxtwitter para obtener las URLs directas
+    de las imagenes. Retorna la lista de URLs o None si falla.
+    """
+    match = re.search(r"/status/(\d+)", url)
+    if not match:
+        logger.warning("Twitter fallback: no se pudo extraer el id del tweet")
+        return None
+    tweet_id: str = match.group(1)
+    headers: dict = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "application/json, text/plain, */*",
+    }
+    for api in (
+        f"https://api.fxtwitter.com/i/status/{tweet_id}",
+        f"https://api.vxtwitter.com/i/status/{tweet_id}",
+    ):
+        try:
+            resp = requests.get(api, headers=headers, timeout=HTTP_MEDIUM_TIMEOUT)
+            if resp.status_code != 200:
+                logger.warning(f"Twitter fallback: {api} respondio {resp.status_code}")
+                continue
+            data: dict = resp.json()
+            urls: list[str] = []
+            for m in (data.get("media_extended") or []):
+                if isinstance(m, dict) and m.get("type") == "image" and m.get("url"):
+                    urls.append(m["url"])
+            if not urls:
+                urls = [u for u in (data.get("mediaURLs") or []) if isinstance(u, str) and u]
+            if urls:
+                logger.info(f"Twitter fallback: {len(urls)} imagenes via {api}")
+                return urls
+        except Exception as e:
+            logger.warning(f"Twitter fallback {api} fallo: {e}")
+    return None
+
+
+def _download_images(urls: list[str], prefix: str) -> list[str]:
+    """Descarga una lista de imagenes a tempdir. Retorna las rutas locales."""
+    paths: list[str] = []
+    headers: dict = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://x.com/",
+    }
+    for i, u in enumerate(urls):
+        if not u:
+            continue
+        ext: str = os.path.splitext(urlparse(u).path)[1].lower()
+        if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            ext = ".jpg"
+        path: str = os.path.join(tempfile.gettempdir(), f"{prefix}_{uuid.uuid4().hex}_{i}{ext}")
+        ok = False
+        for attempt in range(1, 4):
+            try:
+                r = requests.get(u, headers=headers, timeout=HTTP_LONG_TIMEOUT)
+                r.raise_for_status()
+                with open(path, "wb") as f:
+                    f.write(r.content)
+                paths.append(path)
+                ok = True
+                break
+            except Exception as e:
+                logger.warning(f"Imagen {i} intento {attempt}/3 fallo: {e}")
+                if attempt < 3:
+                    time.sleep(1)
+        if not ok:
+            logger.warning(f"Imagen {i} no se pudo descargar: {u}")
+    return paths
+
+
+# ============================================================
 # Handler principal: recibe URLs y las encola
 # ============================================================
 
 async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
-    Valida la(s) URL(s) enviada(s) por el usuario y las encola para procesarlas.
-    Soporta multiples URLs en un solo mensaje (una por linea).
+    Extrae y valida la(s) URL(s) enviada(s) por el usuario y las encola.
+    Soporta multiples URLs, sueltas o embebidas en texto.
     Se procesaran en orden FIFO por usuario.
     """
     if not update.message or not update.message.text:
@@ -641,7 +807,7 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    candidate_urls: list[str] = [line.strip() for line in raw_text.replace("\r\n", "\n").split("\n") if line.strip()]
+    candidate_urls: list[str] = _extract_urls(raw_text)
     logger.info(f"{len(candidate_urls)} URL(s) recibida(s) de {user.id}")
 
     if len(candidate_urls) > MAX_URLS_PER_MESSAGE:
@@ -816,7 +982,7 @@ async def _queue_worker(user_id: int) -> None:
                 )
             except Exception:
                 pass
-            _inc_stats("failed")
+            _record_result(task.url, False)
 
         except Exception as e:
             msg: str = str(e)[:200] or "(sin mensaje)"
@@ -843,7 +1009,7 @@ async def _queue_worker(user_id: int) -> None:
                 )
             except Exception:
                 pass
-            _inc_stats("failed")
+            _record_result(task.url, False)
 
         finally:
             queue.task_done()
@@ -1096,7 +1262,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     message_id=task.processing_msg_id,
                     text="\u274c No se pudieron descargar las imagenes del slideshow.",
                 )
-                _inc_stats("failed")
+                _record_result(url, False)
                 return
 
             await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
@@ -1125,7 +1291,7 @@ async def _execute_download(task: DownloadTask) -> None:
             except Exception:
                 pass
 
-            _inc_stats("successful")
+            _record_result(url, True)
             return
 
     # ================================================================
@@ -1133,7 +1299,7 @@ async def _execute_download(task: DownloadTask) -> None:
     # ================================================================
     logger.info(f"Iniciando descarga yt-dlp para: {url}")
 
-    def download() -> tuple[str, int, bool]:
+    def download() -> tuple[str, int, bool, str]:
         """Funcion bloqueante que corre en el executor para no bloquear el event loop."""
         logger.debug("download: iniciando yt-dlp")
         opts: dict = get_ydl_opts()
@@ -1176,9 +1342,10 @@ async def _execute_download(task: DownloadTask) -> None:
                     logger.warning(f"No se pudo renombrar .NA a .mp4: {e}")
 
             logger.info(f"Archivo localizado para {video_id}: {filename}")
-            return filename, duration, is_video
+            return filename, duration, is_video, info.get("title") or ""
 
     is_reddit: bool = any(d in url for d in ["reddit.com", "redd.it"])
+    is_twitter: bool = any(d in url for d in ["twitter.com", "x.com"])
     downloaded: bool = False
     result: Optional[tuple] = None
 
@@ -1232,7 +1399,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         chat_id=task.chat_id, message_id=task.processing_msg_id,
                         text="\u274c El archivo pesa mas de 50 MB."
                     )
-                    _inc_stats("failed")
+                    _record_result(url, False)
                     return
 
                 ext: str = os.path.splitext(img_filename)[1].lower()
@@ -1257,7 +1424,7 @@ async def _execute_download(task: DownloadTask) -> None:
                             chat_id=task.chat_id, message_id=task.processing_msg_id,
                             text="\u274c La imagen pesa mas de 10 MB y Telegram no puede enviarla."
                         )
-                        _inc_stats("failed")
+                        _record_result(url, False)
                         return
                     await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
                     await _send_file_with_retry(
@@ -1272,7 +1439,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     os.remove(img_filename)
                 except OSError:
                     pass
-                _inc_stats("successful")
+                _record_result(url, True)
                 try:
                     await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
                 except Exception:
@@ -1305,7 +1472,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         chat_id=task.chat_id, message_id=task.processing_msg_id,
                         text="\u274c El archivo pesa mas de 50 MB."
                     )
-                    _inc_stats("failed")
+                    _record_result(url, False)
                     return
 
                 caption = f"\U0001f4e5 Descargado por @{task.bot_username}"
@@ -1327,7 +1494,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     os.remove(tiktok_file)
                 except OSError:
                     pass
-                _inc_stats("successful")
+                _record_result(url, True)
                 try:
                     await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
                 except Exception:
@@ -1336,11 +1503,53 @@ async def _execute_download(task: DownloadTask) -> None:
 
             raise
 
+    # Para Twitter/X: si no hay video, probar descargar las imagenes del tweet
+    if is_twitter:
+        try:
+            result = await loop.run_in_executor(_download_executor, download)
+            downloaded = True
+        except Exception as e:
+            err_text: str = str(e)
+            logger.info(f"Twitter: descarga de video fallo, probando imagenes del tweet: {err_text[:200]}")
+            img_urls: Optional[list] = await loop.run_in_executor(
+                _download_executor, _twitter_images_fallback, url
+            )
+            if img_urls:
+                img_paths: list[str] = await loop.run_in_executor(
+                    _download_executor, _download_images, img_urls, "tw_img"
+                )
+                if not img_paths:
+                    raise
+                await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
+                caption_text = f"\U0001f4e5 Descargado por @{task.bot_username}"
+                for batch_start in range(0, len(img_paths), 10):
+                    batch = img_paths[batch_start:batch_start + 10]
+                    await _send_media_group_with_retry(
+                        bot,
+                        chat_id=task.chat_id,
+                        paths=batch,
+                        reply_to_message_id=task.message_id,
+                        caption_text=caption_text,
+                        first_batch=(batch_start == 0),
+                    )
+                for p in img_paths:
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+                try:
+                    await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
+                except Exception:
+                    pass
+                _record_result(url, True)
+                return
+            raise
+
     # Twitter / Facebook (o Reddit/TikTok cuando download() tuvo exito)
     if not downloaded:
         result = await loop.run_in_executor(_download_executor, download)
 
-    filename, duration, is_video = result
+    filename, duration, is_video, title = result
     file_size = os.path.getsize(filename)
     logger.info(f"Descarga completada: {filename} ({file_size} bytes)")
 
@@ -1356,10 +1565,15 @@ async def _execute_download(task: DownloadTask) -> None:
             text="\u274c El archivo pesa mas de 50 MB.\n"
                  "Telegram no permite enviar archivos tan grandes a traves de bots normales.",
         )
-        _inc_stats("failed")
+        _record_result(url, False)
         return
 
-    caption = f"\U0001f4e5 Descargado por @{task.bot_username}"
+    title = (title or "").strip()
+    if title:
+        title_short: str = title if len(title) <= 200 else title[:197] + "..."
+        caption = f"\U0001f4e5 {title_short}\nDescargado por @{task.bot_username}"
+    else:
+        caption = f"\U0001f4e5 Descargado por @{task.bot_username}"
     file_ext: str = os.path.splitext(filename)[1].lower()
 
     # Solo usar send_animation para archivos .gif reales.
@@ -1409,7 +1623,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 message_id=task.processing_msg_id,
                 text="\u274c La imagen pesa mas de 10 MB y Telegram no puede enviarla.",
             )
-            _inc_stats("failed")
+            _record_result(url, False)
             return
         await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
         await _send_file_with_retry(
@@ -1430,7 +1644,7 @@ async def _execute_download(task: DownloadTask) -> None:
         os.remove(filename)
     except OSError:
         pass
-    _inc_stats("successful")
+    _record_result(url, True)
     logger.info(f"Descarga exitosa para: {url}")
 
     try:
@@ -1445,6 +1659,9 @@ async def _execute_download(task: DownloadTask) -> None:
 # Registro de handlers de Telegram
 # ============================================================
 application.add_handler(CommandHandler("start", start))
+application.add_handler(CommandHandler("help", help_cmd))
+application.add_handler(CommandHandler("id", show_id))
+application.add_handler(CommandHandler("queue", queue_cmd))
 application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("cancel", cancel))
 application.add_handler(
@@ -1474,6 +1691,17 @@ async def _init_bot() -> None:
             drop_pending_updates=True,
         )
         logger.info(f"Webhook configurado en {webhook_url}")
+
+    # Registrar el menu de comandos nativo de Telegram
+    await application.bot.set_my_commands([
+        BotCommand("start", "Mensaje de bienvenida"),
+        BotCommand("help", "Ayuda y plataformas soportadas"),
+        BotCommand("cancel", "Cancelar descargas pendientes"),
+        BotCommand("queue", "Ver tu cola de descargas"),
+        BotCommand("id", "Ver tus IDs de chat/usuario"),
+        BotCommand("stats", "Estadisticas (solo admins)"),
+    ])
+    logger.info("Menu de comandos configurado")
 
 
 def _bot_loop_thread(loop: asyncio.AbstractEventLoop) -> None:
