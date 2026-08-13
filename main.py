@@ -1710,6 +1710,27 @@ def _clean_html(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _translate_es(text: str) -> str:
+    """Traduce un texto a espanol con el endpoint publico de Google Translate.
+
+    Si falla, retorna el texto original para no perder la informacion.
+    """
+    if not text:
+        return ""
+    try:
+        r = requests.get(
+            "https://translate.googleapis.com/translate_a/single",
+            params={"client": "gtx", "sl": "auto", "tl": "es", "dt": "t", "q": text[:4500]},
+            timeout=HTTP_MEDIUM_TIMEOUT,
+        )
+        r.raise_for_status()
+        parts = [seg[0] for seg in r.json()[0] if seg and seg[0]]
+        return "".join(parts) if parts else text
+    except Exception as e:
+        logger.warning(f"Traduccion fallo: {e}")
+        return text
+
+
 def _anilist_query(query: str, variables: dict) -> dict:
     """Ejecuta una query GraphQL contra la API de AniList."""
     resp = requests.post(
@@ -1849,7 +1870,7 @@ def _fmt_relative(minutes: int) -> str:
 
 
 async def _reply_media(update: Update, info: dict, kind: str) -> None:
-    """Envia la info de un anime/manga (con portada si existe)."""
+    """Envia la info de un anime/manga (portada + sinopsis traducida completa)."""
     title = (info.get("title") or {}).get("romaji") or (info.get("title") or {}).get("english") or "?"
     english = (info.get("title") or {}).get("english")
     lines: list[str] = [f"\U0001f4fa {title}"]
@@ -1870,19 +1891,26 @@ async def _reply_media(update: Update, info: dict, kind: str) -> None:
     genres = info.get("genres") or []
     if genres:
         lines.append(f"\U0001f3f7 Generos: {', '.join(genres[:5])}")
-    desc = _clean_html(info.get("description") or "")
-    if desc:
-        desc = desc if len(desc) <= 250 else desc[:247] + "..."
-        lines.append(f"\n\U0001f4dd {desc}")
+
     caption = "\n".join(lines)
     cover = (info.get("coverImage") or {}).get("large")
     if cover:
         try:
             await update.message.reply_photo(photo=cover, caption=caption[:1000])
-            return
         except Exception:
-            pass
-    await update.message.reply_text(caption, disable_web_page_preview=True)
+            await update.message.reply_text(caption, disable_web_page_preview=True)
+    else:
+        await update.message.reply_text(caption, disable_web_page_preview=True)
+
+    # Sinopsis completa traducida al espanol (mensaje aparte para no recortarla)
+    desc = _clean_html(info.get("description") or "")
+    if desc:
+        desc_es = await asyncio.get_running_loop().run_in_executor(
+            _download_executor, _translate_es, desc
+        )
+        if len(desc_es) > 4000:
+            desc_es = desc_es[:3997] + "..."
+        await update.message.reply_text(f"\U0001f4dd Sinopsis:\n\n{desc_es}", disable_web_page_preview=True)
 
 
 async def anime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
