@@ -941,6 +941,44 @@ async def _send_media_group_with_retry(
     raise last_exc
 
 
+def _find_downloaded_file(video_id: str, *extra_candidates: str) -> Optional[str]:
+    """Localiza el archivo real que yt-dlp dejo en disco para un id de video.
+
+    yt-dlp puede nombrar el resultado con extension .NA (HLS de Twitter/X),
+    .mp4, .webm, etc. o, si falta ffmpeg, dejar los fragmentos sueltos. En vez
+    de adivinar la extension, se barre el directorio de trabajo buscando
+    cualquier archivo que contenga el id del video y se devuelve el mas grande
+    (ignorando temporales .part/.ytdl).
+    """
+    candidates: set[str] = set()
+    for c in extra_candidates:
+        if c and os.path.isfile(c):
+            candidates.add(c)
+
+    try:
+        for name in os.listdir("."):
+            if video_id not in name:
+                continue
+            if name.endswith((".part", ".ytdl", ".temp", ".info.json", ".description")):
+                continue
+            full: str = os.path.join(os.getcwd(), name)
+            if os.path.isfile(full):
+                candidates.add(full)
+    except OSError as e:
+        logger.warning(f"No se pudo listar el directorio de descargas: {e}")
+
+    existing: list[tuple[int, str]] = []
+    for c in candidates:
+        try:
+            existing.append((os.path.getsize(c), c))
+        except OSError:
+            continue
+
+    if not existing:
+        return None
+    return max(existing)[1]
+
+
 # ============================================================
 # Ejecucion real de la descarga
 # ============================================================
@@ -1101,20 +1139,43 @@ async def _execute_download(task: DownloadTask) -> None:
         opts: dict = get_ydl_opts()
         with yt_dlp.YoutubeDL(opts) as ydl:
             info: dict = ydl.extract_info(url, download=True)
-            requested = info.get("requested_downloads")
-            if requested:
-                filename: str = requested[0].get("filepath", ydl.prepare_filename(info))
-            else:
-                filename = ydl.prepare_filename(info)
             duration: int = info.get("duration", 0)
             is_video: bool = info.get("is_video", True) or bool(info.get("duration"))
-            if not os.path.exists(filename):
-                base: str = os.path.splitext(filename)[0]
-                for ext in [".mp4", ".webm", ".mkv", ".jpg", ".png", ".webp"]:
-                    candidate: str = base + ext
-                    if os.path.exists(candidate):
-                        filename = candidate
-                        break
+            video_id: str = str(info.get("id", ""))
+
+            # Reunir candidatos: prepare_filename + filepaths de yt-dlp.
+            # Para HLS de Twitter/X la extension es .NA (desconocida) y para
+            # descargas mergeadas el filepath de las partes se borra tras el
+            # merge, por eso no se confia en una unica ruta.
+            candidates: list[str] = []
+            try:
+                candidates.append(ydl.prepare_filename(info))
+            except Exception:
+                pass
+            for rd in info.get("requested_downloads") or []:
+                fp = rd.get("filepath")
+                if fp:
+                    candidates.append(fp)
+
+            filename: Optional[str] = _find_downloaded_file(video_id, *candidates)
+            if not filename:
+                raise FileNotFoundError(
+                    f"yt-dlp descargo el video '{video_id}' pero no se encontro "
+                    f"el archivo resultante en {os.getcwd()}. Candidatos: {candidates}"
+                )
+
+            # HLS de Twitter/X deja la extension .NA (desconocida). Si es un
+            # video, renombrar a .mp4 para que Telegram lo detecte correctamente.
+            if is_video and os.path.splitext(filename)[1].lower() == ".na":
+                mp4_name: str = os.path.splitext(filename)[0] + ".mp4"
+                try:
+                    os.rename(filename, mp4_name)
+                    logger.info(f"Renombrado {filename} -> {mp4_name}")
+                    filename = mp4_name
+                except OSError as e:
+                    logger.warning(f"No se pudo renombrar .NA a .mp4: {e}")
+
+            logger.info(f"Archivo localizado para {video_id}: {filename}")
             return filename, duration, is_video
 
     is_reddit: bool = any(d in url for d in ["reddit.com", "redd.it"])
