@@ -1840,22 +1840,56 @@ def _random_waifu_url() -> Optional[str]:
     return None
 
 
-def _trace_moe_search(image_bytes: bytes) -> Optional[dict]:
-    """Identifica un anime a partir de un screenshot usando trace.moe."""
-    try:
-        r = requests.post(
-            "https://api.trace.moe/search",
-            files={"image": ("frame.jpg", image_bytes, "image/jpeg")},
-            timeout=HTTP_LONG_TIMEOUT,
-        )
-        if r.status_code != 200:
-            logger.warning(f"trace.moe respondio {r.status_code}")
-            return None
-        results = r.json().get("result") or []
-        return results[0] if results else None
-    except Exception as e:
-        logger.warning(f"trace.moe fallo: {e}")
-        return None
+_trace_lock: threading.Lock = threading.Lock()
+
+
+def _trace_moe_search(image_bytes: bytes) -> tuple[Optional[dict], Optional[str]]:
+    """Busca un anime por imagen en trace.moe (API oficial).
+
+    Retorna (resultado, mensaje_de_error); el mensaje es None si hay exito.
+    Usa cutBorders (recorta barras negras de screenshots) y anilistInfo
+    (titulo exacto). Serializa las peticiones: el free tier tiene concurrencia 1.
+    """
+    if len(image_bytes) > 25 * 1024 * 1024:
+        return None, "La imagen es demasiado grande (max 25 MB)."
+
+    url = "https://api.trace.moe/search?cutBorders&anilistInfo"
+    headers = {"User-Agent": "RandomBullshitDownloader/1.0 (personal telegram bot)"}
+
+    for attempt in range(3):
+        with _trace_lock:
+            try:
+                r = requests.post(
+                    url,
+                    files={"image": ("frame.jpg", image_bytes, "image/jpeg")},
+                    headers=headers,
+                    timeout=HTTP_LONG_TIMEOUT,
+                )
+            except Exception as e:
+                logger.warning(f"trace.moe fallo: {e}")
+                return None, "No pude conectar con trace.moe. Proba de nuevo mas tarde."
+
+        if r.status_code == 200:
+            data = r.json()
+            results = data.get("result") or []
+            if results:
+                return results[0], None
+            return None, "No encontre coincidencias para esa imagen."
+
+        if r.status_code == 413:
+            return None, "La imagen es demasiado grande (max 25 MB)."
+
+        if r.status_code in (402, 429, 503):
+            logger.warning(f"trace.moe {r.status_code}, reintento {attempt+1}/3")
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            return None, "trace.moe esta saturado o alcanzaste el limite de busquedas. Proba de nuevo mas tarde."
+
+        logger.warning(f"trace.moe respondio {r.status_code}: {r.text[:200]}")
+        return None, f"trace.moe respondio {r.status_code}. Proba de nuevo mas tarde."
+
+    return None, "trace.moe no respondio correctamente."
 
 
 def _fmt_relative(minutes: int) -> str:
@@ -1999,24 +2033,35 @@ async def identify_anime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.warning(f"No se pudo descargar la imagen para trace.moe: {e}")
         await msg.edit_text("\u274c No pude descargar la imagen.")
         return
-    result = await asyncio.get_running_loop().run_in_executor(
+    result, error = await asyncio.get_running_loop().run_in_executor(
         _download_executor, _trace_moe_search, bytes(data)
     )
-    if not result:
-        await msg.edit_text("\u274c No pude identificar el anime en esa imagen. Proba con otra captura mas clara.")
+    if error:
+        await msg.edit_text(f"\u274c {error}")
         return
-    filename = result.get("filename") or ""
-    anime_title = filename.rsplit(" - ", 1)[0] if " - " in filename else "Desconocido"
+
+    # Titulo: preferir anilistInfo (objeto) y caer al parseo del filename
+    anilist_info = result.get("anilist")
+    if isinstance(anilist_info, dict):
+        t = anilist_info.get("title") or {}
+        anime_title = t.get("romaji") or t.get("english") or t.get("native") or "Desconocido"
+    else:
+        filename = result.get("filename") or ""
+        anime_title = filename.rsplit(" - ", 1)[0] if " - " in filename else (filename or "Desconocido")
+
     ep = result.get("episode")
     similarity = round((result.get("similarity") or 0) * 100, 1)
-    from_sec = result.get("from") or 0
-    ts = f"{int(from_sec // 60)}:{int(from_sec % 60):02d}"
+    at_sec = result.get("at") or result.get("from") or 0
+    ts = f"{int(at_sec // 60)}:{int(at_sec % 60):02d}"
     caption = (
         f"\U0001f3cc {anime_title}\n"
         f"\U0001f4fa Episodio: {ep if ep else '?'}\n"
         f"\u23f1 Tiempo: ~{ts}\n"
         f"\U0001f3af Similitud: {similarity}%"
     )
+    if similarity < 90:
+        caption += "\n\u26a0\ufe0f Resultado poco confiable (similitud baja)"
+
     preview = result.get("image")
     if preview:
         try:
