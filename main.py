@@ -8,7 +8,6 @@ import concurrent.futures
 import traceback
 import re
 import uuid
-import random
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
@@ -1692,38 +1691,6 @@ async def _execute_download(task: DownloadTask) -> None:
 # ============================================================
 # Funciones de anime (APIs externas)
 # ============================================================
-_ANIME_QUOTES: list[tuple[str, str, str]] = [
-    ("Naruto Uzumaki", "Naruto", "Yo nunca me doy por vencido. ¡Ese es mi camino ninja!"),
-    ("Itachi Uchiha", "Naruto", "No importa lo que pase, siempre te amare."),
-    ("Kakashi Hatake", "Naruto", "Los que rompen las reglas son escoria, pero los que abandonan a sus amigos son peor que escoria."),
-    ("Hinata Hyuga", "Naruto", "Naruto-kun... yo tambien quiero ser fuerte."),
-    ("Monkey D. Luffy", "One Piece", "¡Voy a ser el Rey de los Piratas!"),
-    ("Roronoa Zoro", "One Piece", "Cuando el mundo te de la espalda, yo estare a tu lado."),
-    ("Edward Newgate", "One Piece", "¡El One Piece es real!"),
-    ("Goku", "Dragon Ball Z", "¡Kamehameha!"),
-    ("Vegeta", "Dragon Ball Z", "El orgullo de un Saiyajin no se rompe jamas."),
-    ("Saitama", "One Punch Man", "Soy un heroe por diversion."),
-    ("Levi Ackerman", "Attack on Titan", "No se en que se basa la gente para decidir, pero yo elijo mis propias decisiones."),
-    ("Eren Yeager", "Attack on Titan", "Luchare. Luchare hasta el final."),
-    ("Mikasa Ackerman", "Attack on Titan", "Si muero, no podre recordarte."),
-    ("Light Yagami", "Death Note", "Yo soy la justicia. Yo soy el dios del nuevo mundo."),
-    ("L Lawliet", "Death Note", "El riesgo no es algo que me detenga."),
-    ("Edward Elric", "Fullmetal Alchemist", "Un corazon hecho de acero no es algo que se pueda romper."),
-    ("Roy Mustang", "Fullmetal Alchemist", "Es un dia terrible para la lluvia."),
-    ("Rintarou Okabe", "Steins;Gate", "¡El psico-kongroo! ¡Esta es la eleccion de Steins Gate!"),
-    ("Kurisu Makise", "Steins;Gate", "No hay mejor lugar para un cientifico que el laboratorio."),
-    ("Lelouch Lamperouge", "Code Geass", "Si el rey no se mueve, sus subditos no lo seguiran."),
-    ("Izuku Midoriya", "My Hero Academia", "¡Voy a ser un heroe que salva a todos con una sonrisa!"),
-    ("All Might", "My Hero Academia", "¡Yo estoy aqui!"),
-    ("Katsuki Bakugo", "My Hero Academia", "¡Morire antes de perder!"),
-    ("Gintoki Sakata", "Gintama", "La vida es como un videojuego: si no te diviertes, no sirve."),
-    ("Spike Spiegel", "Cowboy Bebop", "Lo que pase, pasa."),
-    ("Rei Ayanami", "Evangelion", "No se como sentirme."),
-    ("Kamina", "Gurren Lagann", "¡Cree en ti! ¡Cree en el tu que cree en ti mismo!"),
-    ("Yato", "Noragami", "¡Soy Yato, el dios de la calamidad!"),
-    ("Hachiman Hikigaya", "Oregairu", "La juventud es una mentira."),
-    ("Shinobu Kocho", "Demon Slayer", "No importa cuantas veces caiga, me levantare."),
-]
 
 _STATUS_ES: dict[str, str] = {
     "FINISHED": "Finalizado",
@@ -1851,11 +1818,6 @@ def _random_waifu_url() -> Optional[str]:
         except Exception as e:
             logger.warning(f"Waifu API {url} fallo: {e}")
     return None
-
-
-def _random_quote() -> tuple[str, str, str]:
-    """Retorna una cita de anime aleatoria de la lista local."""
-    return random.choice(_ANIME_QUOTES)
 
 
 def _trace_moe_search(image_bytes: bytes) -> Optional[dict]:
@@ -1997,12 +1959,6 @@ async def waifu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_photo(photo=url, caption="Aqui tienes tu waifu \U0001f458")
 
 
-async def quote_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    """Envia una cita random de anime."""
-    character, anime, quote = _random_quote()
-    await update.message.reply_text(f"\u00ab{quote}\u00bb\n\u2014 {character} ({anime})")
-
-
 async def identify_anime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Identifica un anime a partir de un screenshot usando trace.moe."""
     if not update.message or not update.message.photo:
@@ -2064,7 +2020,6 @@ application.add_handler(CommandHandler("manga", manga_cmd))
 application.add_handler(CommandHandler("temporada", temporada_cmd))
 application.add_handler(CommandHandler("hoy", hoy_cmd))
 application.add_handler(CommandHandler("waifu", waifu_cmd))
-application.add_handler(CommandHandler("quote", quote_cmd))
 application.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, download_video)
 )
@@ -2107,7 +2062,6 @@ async def _init_bot() -> None:
         BotCommand("temporada", "Animes de la temporada actual"),
         BotCommand("hoy", "Emisiones de las proximas 24h"),
         BotCommand("waifu", "Imagen random de waifu"),
-        BotCommand("quote", "Cita random de anime"),
     ])
     logger.info("Menu de comandos configurado")
 
