@@ -8,6 +8,7 @@ import concurrent.futures
 import traceback
 import re
 import uuid
+import random
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
@@ -1689,6 +1690,367 @@ async def _execute_download(task: DownloadTask) -> None:
         pass
 
 # ============================================================
+# Funciones de anime (APIs externas)
+# ============================================================
+_ANIME_QUOTES: list[tuple[str, str, str]] = [
+    ("Naruto Uzumaki", "Naruto", "Yo nunca me doy por vencido. ¡Ese es mi camino ninja!"),
+    ("Itachi Uchiha", "Naruto", "No importa lo que pase, siempre te amare."),
+    ("Kakashi Hatake", "Naruto", "Los que rompen las reglas son escoria, pero los que abandonan a sus amigos son peor que escoria."),
+    ("Hinata Hyuga", "Naruto", "Naruto-kun... yo tambien quiero ser fuerte."),
+    ("Monkey D. Luffy", "One Piece", "¡Voy a ser el Rey de los Piratas!"),
+    ("Roronoa Zoro", "One Piece", "Cuando el mundo te de la espalda, yo estare a tu lado."),
+    ("Edward Newgate", "One Piece", "¡El One Piece es real!"),
+    ("Goku", "Dragon Ball Z", "¡Kamehameha!"),
+    ("Vegeta", "Dragon Ball Z", "El orgullo de un Saiyajin no se rompe jamas."),
+    ("Saitama", "One Punch Man", "Soy un heroe por diversion."),
+    ("Levi Ackerman", "Attack on Titan", "No se en que se basa la gente para decidir, pero yo elijo mis propias decisiones."),
+    ("Eren Yeager", "Attack on Titan", "Luchare. Luchare hasta el final."),
+    ("Mikasa Ackerman", "Attack on Titan", "Si muero, no podre recordarte."),
+    ("Light Yagami", "Death Note", "Yo soy la justicia. Yo soy el dios del nuevo mundo."),
+    ("L Lawliet", "Death Note", "El riesgo no es algo que me detenga."),
+    ("Edward Elric", "Fullmetal Alchemist", "Un corazon hecho de acero no es algo que se pueda romper."),
+    ("Roy Mustang", "Fullmetal Alchemist", "Es un dia terrible para la lluvia."),
+    ("Rintarou Okabe", "Steins;Gate", "¡El psico-kongroo! ¡Esta es la eleccion de Steins Gate!"),
+    ("Kurisu Makise", "Steins;Gate", "No hay mejor lugar para un cientifico que el laboratorio."),
+    ("Lelouch Lamperouge", "Code Geass", "Si el rey no se mueve, sus subditos no lo seguiran."),
+    ("Izuku Midoriya", "My Hero Academia", "¡Voy a ser un heroe que salva a todos con una sonrisa!"),
+    ("All Might", "My Hero Academia", "¡Yo estoy aqui!"),
+    ("Katsuki Bakugo", "My Hero Academia", "¡Morire antes de perder!"),
+    ("Gintoki Sakata", "Gintama", "La vida es como un videojuego: si no te diviertes, no sirve."),
+    ("Spike Spiegel", "Cowboy Bebop", "Lo que pase, pasa."),
+    ("Rei Ayanami", "Evangelion", "No se como sentirme."),
+    ("Kamina", "Gurren Lagann", "¡Cree en ti! ¡Cree en el tu que cree en ti mismo!"),
+    ("Yato", "Noragami", "¡Soy Yato, el dios de la calamidad!"),
+    ("Hachiman Hikigaya", "Oregairu", "La juventud es una mentira."),
+    ("Shinobu Kocho", "Demon Slayer", "No importa cuantas veces caiga, me levantare."),
+]
+
+_STATUS_ES: dict[str, str] = {
+    "FINISHED": "Finalizado",
+    "RELEASING": "En emision",
+    "NOT_YET_RELEASED": "Por estrenar",
+    "HIATUS": "En pausa",
+    "CANCELLED": "Cancelado",
+}
+
+
+def _clean_html(text: str) -> str:
+    """Elimina etiquetas HTML de las descripciones de AniList."""
+    if not text:
+        return ""
+    text = re.sub(r"<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _anilist_query(query: str, variables: dict) -> dict:
+    """Ejecuta una query GraphQL contra la API de AniList."""
+    resp = requests.post(
+        "https://graphql.anilist.co",
+        json={"query": query, "variables": variables},
+        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
+        timeout=HTTP_MEDIUM_TIMEOUT,
+    )
+    resp.raise_for_status()
+    data: dict = resp.json()
+    if data.get("errors"):
+        raise RuntimeError(str(data["errors"][0].get("message", "error de AniList")))
+    return data.get("data", {})
+
+
+def _search_anilist(kind: str, query: str) -> Optional[dict]:
+    """Busca anime/manga en AniList y retorna el primer resultado."""
+    media_type = "ANIME" if kind == "anime" else "MANGA"
+    gql = """
+    query ($s: String, $t: MediaType) {
+      Media(search: $s, type: $t) {
+        id
+        title { romaji english native }
+        description
+        averageScore
+        episodes
+        chapters
+        volumes
+        status
+        genres
+        seasonYear
+        coverImage { large }
+        siteUrl
+      }
+    }
+    """
+    data = _anilist_query(gql, {"s": query, "t": media_type})
+    return data.get("Media")
+
+
+def _current_season() -> tuple[str, int]:
+    """Devuelve la temporada actual de anime (WINTER/SPRING/SUMMER/FALL) y el anio."""
+    t = time.gmtime()
+    month, year = t.tm_mon, t.tm_year
+    if month in (1, 2, 3):
+        season = "WINTER"
+    elif month in (4, 5, 6):
+        season = "SPRING"
+    elif month in (7, 8, 9):
+        season = "SUMMER"
+    else:
+        season = "FALL"
+    return season, year
+
+
+def _seasonal_anime() -> list[dict]:
+    """Retorna los animes mas populares de la temporada actual."""
+    season, year = _current_season()
+    gql = """
+    query ($season: MediaSeason, $year: Int) {
+      Page(page: 1, perPage: 10) {
+        media(season: $season, seasonYear: $year, type: ANIME, sort: POPULARITY_DESC) {
+          title { romaji english }
+          averageScore
+          episodes
+        }
+      }
+    }
+    """
+    data = _anilist_query(gql, {"season": season, "year": year})
+    return (data.get("Page") or {}).get("media") or []
+
+
+def _upcoming_airing(hours: int = 24) -> list[dict]:
+    """Retorna las emisiones de anime de las proximas horas (AniList)."""
+    now = int(time.time())
+    end = now + hours * 3600
+    gql = """
+    query ($start: Int, $end: Int) {
+      Page(page: 1, perPage: 15) {
+        airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: TIME) {
+          episode
+          airingAt
+          media { title { romaji english } }
+        }
+      }
+    }
+    """
+    data = _anilist_query(gql, {"start": now, "end": end})
+    return (data.get("Page") or {}).get("airingSchedules") or []
+
+
+def _random_waifu_url() -> Optional[str]:
+    """Obtiene una URL de imagen waifu (nekos.life, con fallback nekos.best)."""
+    headers = {"User-Agent": "RandomBullshitDownloader/1.0 (personal bot)"}
+    for url in ("https://nekos.life/api/v2/img/waifu", "https://nekos.best/api/v2/neko"):
+        try:
+            r = requests.get(url, headers=headers, timeout=HTTP_MEDIUM_TIMEOUT)
+            r.raise_for_status()
+            data = r.json()
+            if data.get("url"):
+                return data["url"]
+            results = data.get("results") or []
+            if results and results[0].get("url"):
+                return results[0]["url"]
+        except Exception as e:
+            logger.warning(f"Waifu API {url} fallo: {e}")
+    return None
+
+
+def _random_quote() -> tuple[str, str, str]:
+    """Retorna una cita de anime aleatoria de la lista local."""
+    return random.choice(_ANIME_QUOTES)
+
+
+def _trace_moe_search(image_bytes: bytes) -> Optional[dict]:
+    """Identifica un anime a partir de un screenshot usando trace.moe."""
+    try:
+        r = requests.post(
+            "https://api.trace.moe/search",
+            files={"image": ("frame.jpg", image_bytes, "image/jpeg")},
+            timeout=HTTP_LONG_TIMEOUT,
+        )
+        if r.status_code != 200:
+            logger.warning(f"trace.moe respondio {r.status_code}")
+            return None
+        results = r.json().get("result") or []
+        return results[0] if results else None
+    except Exception as e:
+        logger.warning(f"trace.moe fallo: {e}")
+        return None
+
+
+def _fmt_relative(minutes: int) -> str:
+    """Formatea minutos relativos en texto legible."""
+    if minutes < 1:
+        return "ahora"
+    if minutes < 60:
+        return f"en {minutes} min"
+    h = minutes // 60
+    m = minutes % 60
+    return f"en {h}h {m:02d}m"
+
+
+async def _reply_media(update: Update, info: dict, kind: str) -> None:
+    """Envia la info de un anime/manga (con portada si existe)."""
+    title = (info.get("title") or {}).get("romaji") or (info.get("title") or {}).get("english") or "?"
+    english = (info.get("title") or {}).get("english")
+    lines: list[str] = [f"\U0001f4fa {title}"]
+    if english and english != title:
+        lines.append(f"\U0001f1ec\U0001f1e7 {english}")
+    if info.get("averageScore"):
+        lines.append(f"\u2b50 Score: {info['averageScore']}/100")
+    if kind == "anime" and info.get("episodes"):
+        lines.append(f"\U0001f3ac Episodios: {info['episodes']}")
+    if kind == "manga":
+        if info.get("chapters"):
+            lines.append(f"\U0001f4d6 Capitulos: {info['chapters']}")
+        if info.get("volumes"):
+            lines.append(f"\U0001f4da Volumenes: {info['volumes']}")
+    lines.append(f"\U0001f4cc Estado: {_STATUS_ES.get(info.get('status'), info.get('status') or '?')}")
+    if info.get("seasonYear"):
+        lines.append(f"\U0001f5d3 Anio: {info['seasonYear']}")
+    genres = info.get("genres") or []
+    if genres:
+        lines.append(f"\U0001f3f7 Generos: {', '.join(genres[:5])}")
+    desc = _clean_html(info.get("description") or "")
+    if desc:
+        desc = desc if len(desc) <= 250 else desc[:247] + "..."
+        lines.append(f"\n\U0001f4dd {desc}")
+    caption = "\n".join(lines)
+    cover = (info.get("coverImage") or {}).get("large")
+    if cover:
+        try:
+            await update.message.reply_photo(photo=cover, caption=caption[:1000])
+            return
+        except Exception:
+            pass
+    await update.message.reply_text(caption, disable_web_page_preview=True)
+
+
+async def anime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Busca un anime en AniList."""
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Uso: /anime <nombre>\nEjemplo: /anime naruto")
+        return
+    await _send_chat_action(context.bot, update.effective_chat.id, ChatAction.TYPING)
+    info = await asyncio.get_running_loop().run_in_executor(_download_executor, _search_anilist, "anime", query)
+    if not info:
+        await update.message.reply_text("\u274c No encontre ese anime. Proba con otro nombre.")
+        return
+    await _reply_media(update, info, "anime")
+
+
+async def manga_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Busca un manga en AniList."""
+    query = " ".join(context.args).strip()
+    if not query:
+        await update.message.reply_text("Uso: /manga <nombre>\nEjemplo: /manga berserk")
+        return
+    await _send_chat_action(context.bot, update.effective_chat.id, ChatAction.TYPING)
+    info = await asyncio.get_running_loop().run_in_executor(_download_executor, _search_anilist, "manga", query)
+    if not info:
+        await update.message.reply_text("\u274c No encontre ese manga. Proba con otro nombre.")
+        return
+    await _reply_media(update, info, "manga")
+
+
+async def temporada_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra los animes mas populares de la temporada actual."""
+    await _send_chat_action(update.get_bot(), update.effective_chat.id, ChatAction.TYPING)
+    media = await asyncio.get_running_loop().run_in_executor(_download_executor, _seasonal_anime)
+    if not media:
+        await update.message.reply_text("\u274c No pude obtener la temporada actual.")
+        return
+    season, year = _current_season()
+    lines = [f"\U0001f331 Temporada {season} {year} — Top 10:\n"]
+    for i, m in enumerate(media, 1):
+        t = (m.get("title") or {}).get("romaji") or (m.get("title") or {}).get("english") or "?"
+        score = m.get("averageScore") or "?"
+        ep = m.get("episodes") or "?"
+        lines.append(f"{i}. {t} — \u2b50{score} — {ep} ep")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def hoy_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra las emisiones de anime de las proximas 24h."""
+    await _send_chat_action(update.get_bot(), update.effective_chat.id, ChatAction.TYPING)
+    sched = await asyncio.get_running_loop().run_in_executor(_download_executor, _upcoming_airing, 24)
+    if not sched:
+        await update.message.reply_text("\U0001f4e1 No hay emisiones en las proximas 24h.")
+        return
+    lines = ["\U0001f4e1 Emisiones proximas (24h):\n"]
+    for s in sched:
+        m = s.get("media") or {}
+        t = (m.get("title") or {}).get("romaji") or (m.get("title") or {}).get("english") or "?"
+        ep = s.get("episode")
+        airing_at = s.get("airingAt", 0)
+        when = _fmt_relative(int((airing_at - time.time()) // 60))
+        lines.append(f"\u2022 {t} — Ep {ep if ep else '?'} — {when}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def waifu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envia una imagen random de waifu."""
+    await _send_chat_action(context.bot, update.effective_chat.id, ChatAction.UPLOAD_PHOTO)
+    url = await asyncio.get_running_loop().run_in_executor(_download_executor, _random_waifu_url)
+    if not url:
+        await update.message.reply_text("\u274c No pude conseguir una waifu ahora. Proba de nuevo.")
+        return
+    await update.message.reply_photo(photo=url, caption="Aqui tienes tu waifu \U0001f458")
+
+
+async def quote_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Envia una cita random de anime."""
+    character, anime, quote = _random_quote()
+    await update.message.reply_text(f"\u00ab{quote}\u00bb\n\u2014 {character} ({anime})")
+
+
+async def identify_anime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Identifica un anime a partir de un screenshot usando trace.moe."""
+    if not update.message or not update.message.photo:
+        return
+    photo = update.message.photo[-1]
+    msg = await update.message.reply_text("\U0001f50d Identificando anime...")
+    try:
+        f = await context.bot.get_file(photo.file_id)
+        data = await f.download_as_bytearray()
+    except Exception as e:
+        logger.warning(f"No se pudo descargar la imagen para trace.moe: {e}")
+        await msg.edit_text("\u274c No pude descargar la imagen.")
+        return
+    result = await asyncio.get_running_loop().run_in_executor(
+        _download_executor, _trace_moe_search, bytes(data)
+    )
+    if not result:
+        await msg.edit_text("\u274c No pude identificar el anime en esa imagen. Proba con otra captura mas clara.")
+        return
+    filename = result.get("filename") or ""
+    anime_title = filename.rsplit(" - ", 1)[0] if " - " in filename else "Desconocido"
+    ep = result.get("episode")
+    similarity = round((result.get("similarity") or 0) * 100, 1)
+    from_sec = result.get("from") or 0
+    ts = f"{int(from_sec // 60)}:{int(from_sec % 60):02d}"
+    caption = (
+        f"\U0001f3cc {anime_title}\n"
+        f"\U0001f4fa Episodio: {ep if ep else '?'}\n"
+        f"\u23f1 Tiempo: ~{ts}\n"
+        f"\U0001f3af Similitud: {similarity}%"
+    )
+    preview = result.get("image")
+    if preview:
+        try:
+            await context.bot.send_photo(
+                chat_id=update.effective_chat.id,
+                photo=preview,
+                caption=caption,
+                reply_to_message_id=update.message.message_id,
+            )
+            await msg.delete()
+            return
+        except Exception:
+            pass
+    await msg.edit_text(caption)
+
+
+# ============================================================
 # Registro de handlers de Telegram
 # ============================================================
 application.add_handler(CommandHandler("start", start))
@@ -1697,9 +2059,16 @@ application.add_handler(CommandHandler("id", show_id))
 application.add_handler(CommandHandler("queue", queue_cmd))
 application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("cancel", cancel))
+application.add_handler(CommandHandler("anime", anime_cmd))
+application.add_handler(CommandHandler("manga", manga_cmd))
+application.add_handler(CommandHandler("temporada", temporada_cmd))
+application.add_handler(CommandHandler("hoy", hoy_cmd))
+application.add_handler(CommandHandler("waifu", waifu_cmd))
+application.add_handler(CommandHandler("quote", quote_cmd))
 application.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, download_video)
 )
+application.add_handler(MessageHandler(filters.PHOTO, identify_anime))
 
 # ============================================================
 # Lifecycle del bot (thread-safe)
@@ -1733,6 +2102,12 @@ async def _init_bot() -> None:
         BotCommand("queue", "Ver tu cola de descargas"),
         BotCommand("id", "Ver tus IDs de chat/usuario"),
         BotCommand("stats", "Estadisticas (solo admins)"),
+        BotCommand("anime", "Buscar info de un anime"),
+        BotCommand("manga", "Buscar info de un manga"),
+        BotCommand("temporada", "Animes de la temporada actual"),
+        BotCommand("hoy", "Emisiones de las proximas 24h"),
+        BotCommand("waifu", "Imagen random de waifu"),
+        BotCommand("quote", "Cita random de anime"),
     ])
     logger.info("Menu de comandos configurado")
 
