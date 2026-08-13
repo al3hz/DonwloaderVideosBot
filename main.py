@@ -1803,20 +1803,19 @@ def _upcoming_airing(hours: int = 24) -> list[dict]:
 
 
 def _random_waifu_url() -> Optional[str]:
-    """Obtiene una URL de imagen waifu (nekos.life, con fallback nekos.best)."""
-    headers = {"User-Agent": "RandomBullshitDownloader/1.0 (personal bot)"}
-    for url in ("https://nekos.life/api/v2/img/waifu", "https://nekos.best/api/v2/neko"):
-        try:
-            r = requests.get(url, headers=headers, timeout=HTTP_MEDIUM_TIMEOUT)
-            r.raise_for_status()
-            data = r.json()
-            if data.get("url"):
-                return data["url"]
-            results = data.get("results") or []
-            if results and results[0].get("url"):
-                return results[0]["url"]
-        except Exception as e:
-            logger.warning(f"Waifu API {url} fallo: {e}")
+    """Obtiene una URL de imagen waifu desde la API de nekos.best."""
+    try:
+        r = requests.get(
+            "https://nekos.best/api/v2/waifu",
+            headers={"User-Agent": "RandomBullshitDownloader/1.0 (personal telegram bot)"},
+            timeout=HTTP_MEDIUM_TIMEOUT,
+        )
+        r.raise_for_status()
+        results = r.json().get("results") or []
+        if results and results[0].get("url"):
+            return results[0]["url"]
+    except Exception as e:
+        logger.warning(f"Waifu API nekos.best fallo: {e}")
     return None
 
 
