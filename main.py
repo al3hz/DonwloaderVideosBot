@@ -211,18 +211,25 @@ application: Application = Application.builder().token(TOKEN).request(_tg_reques
 # ============================================================
 
 async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-    """Mensaje de bienvenida con las plataformas soportadas y el sistema de cola."""
+    """Mensaje de bienvenida con plataformas, funciones de anime y sistema de cola."""
     user = update.effective_user
     logger.info(f"Comando /start de {user.id} (@{user.username})")
     text = (
         "\U0001f44b \u00a1Hola! Soy tu bot de descargas.\n\n"
-        "\U0001f4ce **Enviame un enlace** de:\n"
+        "\U0001f4e5 **Descarga videos de:**\n"
         "\u2022 TikTok (sin marca de agua)\n"
         "\u2022 Facebook (videos / Reels)\n"
         "\u2022 Twitter / X (videos, GIFs e imagenes)\n"
         "\u2022 Reddit (videos, imagenes y GIFs)\n"
         "\u2022 Bilibili (anime, clips, AMVs)\n"
         "\u2022 Niconico (anime, MADs, musica)\n\n"
+        "\U0001f38c **Funciones de anime:**\n"
+        "\u2022 /anime <nombre> \u2014 info + sinopsis en espanol\n"
+        "\u2022 /manga <nombre> \u2014 info de manga\n"
+        "\u2022 /temporada \u2014 animes de la temporada\n"
+        "\u2022 /hoy \u2014 emisiones de las proximas 24h\n"
+        "\u2022 /waifu \u2014 imagen random\n"
+        "\u2022 Enviame un screenshot y lo identifico (anime, episodio y tiempo)\n\n"
         "\U0001f4e6 **Cola por usuario:**\n"
         "Puedes enviar varios enlaces seguidos. Se procesaran en orden.\n"
         "Usa /queue para ver tus pendientes y /cancel para vaciar la cola.\n\n"
