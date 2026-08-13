@@ -7,6 +7,7 @@ import logging
 import concurrent.futures
 import traceback
 import re
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
@@ -14,7 +15,11 @@ from urllib.parse import urlparse, parse_qs
 from flask import Flask, request, jsonify
 from telegram import Update, InputMediaPhoto, Message
 from telegram.constants import ChatAction
-from telegram.error import TimedOut as TelegramTimedOut, NetworkError as TelegramNetworkError
+from telegram.error import (
+    TimedOut as TelegramTimedOut,
+    NetworkError as TelegramNetworkError,
+    RetryAfter as TelegramRetryAfter,
+)
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from telegram.request import HTTPXRequest
 import yt_dlp
@@ -35,14 +40,30 @@ if not TOKEN:
 
 WEBHOOK_SECRET: Optional[str] = os.environ.get("TELEGRAM_WEBHOOK_SECRET")
 
-PORT: int = int(os.environ.get("PORT", 8080))
+def _env_int(name: str, default: int) -> int:
+    """Lee una variable de entorno como entero con fallback seguro.
+
+    Si la variable no esta definida o no es un entero valido, retorna el
+    default y loguea un warning (evita que un typo en Render tumbe el import).
+    """
+    raw: str = os.environ.get(name, "")
+    if raw == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        logger.warning(f"Variable {name} invalida ('{raw}'), usando default {default}")
+        return default
+
+
+PORT: int = _env_int("PORT", 8080)
 RENDER_EXTERNAL_URL: Optional[str] = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 ADMIN_IDS: list[int] = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
 ALLOWED_DOMAINS: list[str] = ["tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.com", "reddit.com", "redd.it"]
 COOKIES_FILE: str = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR: str = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
-MAX_URLS_PER_MESSAGE: int = int(os.environ.get("MAX_URLS_PER_MESSAGE", 20))
+MAX_URLS_PER_MESSAGE: int = _env_int("MAX_URLS_PER_MESSAGE", 20)
 
 # ============================================================
 # Constantes de timeout (evita valores dispersos en el codigo)
@@ -118,7 +139,7 @@ async def _send_chat_action(bot, chat_id: int, action) -> None:
         _chat_action_last_sent[chat_id] = now
     try:
         await bot.send_chat_action(chat_id=chat_id, action=action)
-    except (TelegramTimedOut, TelegramNetworkError):
+    except (TelegramTimedOut, TelegramNetworkError, TelegramRetryAfter):
         pass
 
 # ============================================================
@@ -174,7 +195,8 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Twitter / X (Videos / GIF)\n"
         "\u2022 Reddit (videos, imagenes y GIFs)\n\n"
         "\U0001f4e6 **Cola por usuario:**\n"
-        "Puedes enviar varios enlaces seguidos. Se procesaran en orden.\n\n"
+        "Puedes enviar varios enlaces seguidos. Se procesaran en orden.\n"
+        "Usa /cancel para vaciar tu cola de pendientes.\n\n"
         "\u26a0\ufe0f Limite: 50 MB por archivo."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -206,6 +228,40 @@ async def stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
     await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Vacia la cola de pendientes del usuario.
+
+    No interrumpe una descarga ya en curso: solo elimina las tareas encoladas.
+    El worker seguira vivo, terminara lo que este haciendo y luego se
+    autolimpiara tras el periodo de inactividad habitual.
+    """
+    user = update.effective_user
+    queue = _user_queues.get(user.id)
+    if not queue:
+        await update.message.reply_text("\u2139\ufe0f No tienes tareas en la cola.")
+        return
+
+    drained: int = 0
+    while True:
+        try:
+            queue.get_nowait()
+            queue.task_done()
+            drained += 1
+        except asyncio.QueueEmpty:
+            break
+
+    logger.info(f"Cola cancelada para {user.id}: {drained} tarea(s) eliminada(s)")
+
+    if drained == 0:
+        await update.message.reply_text("\u2139\ufe0f No tienes tareas pendientes en la cola.")
+    else:
+        await update.message.reply_text(
+            f"\u2705 Canceladas **{drained}** tarea(s) pendientes.\n"
+            "Si hay una descarga en curso, se completara igualmente.",
+            parse_mode="Markdown",
+        )
 
 # ============================================================
 # Opciones de yt-dlp
@@ -367,7 +423,7 @@ def _tiktok_video_api_fallback(url: str) -> Optional[str]:
         r.raise_for_status()
         filename: str = os.path.join(
             tempfile.gettempdir(),
-            f"tiktok_video_{int(time.time())}.mp4",
+            f"tiktok_video_{uuid.uuid4().hex}.mp4",
         )
         with open(filename, "wb") as f:
             f.write(r.content)
@@ -707,6 +763,21 @@ async def _queue_worker(user_id: int) -> None:
                 "This video is only available for registered users": (
                     "\u274c Este video requiere inicio de sesion en la plataforma."
                 ),
+                "login required": (
+                    "\u274c Esta plataforma requiere iniciar sesion para descargar este contenido."
+                ),
+                "has been removed": (
+                    "\u274c Este video fue eliminado de la plataforma."
+                ),
+                "video unavailable": (
+                    "\u274c El video no esta disponible o fue eliminado."
+                ),
+                "not available in your country": (
+                    "\u274c Este contenido tiene restriccion geografica y no se puede descargar."
+                ),
+                "private": (
+                    "\u274c Este contenido es privado y no se puede descargar."
+                ),
                 "may not be comfortable for some audiences": (
                     "\u274c Este video fue marcado como **sensible** por TikTok.\n"
                     "No es posible descargarlo sin iniciar sesion."
@@ -722,8 +793,9 @@ async def _queue_worker(user_id: int) -> None:
                 ),
             }
             display_msg: str = f"\u274c Error de descarga:\n`{err_msg[:200]}`"
+            err_lower: str = err_msg.lower()
             for key, msg in friendly.items():
-                if key in err_msg:
+                if key.lower() in err_lower:
                     display_msg = msg
                     break
 
@@ -791,6 +863,14 @@ async def _send_file_with_retry(bot, filename: str, send_factory, max_retries: i
         try:
             with open(filename, "rb") as f:
                 return await send_factory(f)
+        except TelegramRetryAfter as e:
+            last_exc = e
+            delay: float = float(e.retry_after)
+            logger.warning(
+                f"Flood control (429) enviando {filename}: esperando {delay}s "
+                f"(intento {attempt+1}/{max_retries})"
+            )
+            await asyncio.sleep(delay)
         except (TelegramTimedOut, TelegramNetworkError) as e:
             last_exc = e
             delay: float = WORKER_RETRY_DELAY_BASE * (2 ** attempt)
@@ -799,6 +879,65 @@ async def _send_file_with_retry(bot, filename: str, send_factory, max_retries: i
         except Exception:
             raise
     logger.error(f"Se agotaron los reintentos para enviar {filename}: {last_exc}")
+    raise last_exc
+
+
+async def _send_media_group_with_retry(
+    bot,
+    chat_id: int,
+    paths: list[str],
+    reply_to_message_id: int,
+    caption_text: str,
+    first_batch: bool,
+    max_retries: int = 3,
+):
+    """
+    Envia un album de fotos con reintentos (timeouts y flood control 429).
+
+    Cada reintento re-abre los archivos para evitar punteros de lectura gastados
+    y cierra SIEMPRE los descriptores en un bloque finally.
+    """
+    last_exc = None
+    for attempt in range(max_retries):
+        files: list = []
+        try:
+            media_group: list[InputMediaPhoto] = []
+            for i, path in enumerate(paths):
+                f = open(path, "rb")
+                files.append(f)
+                if first_batch and i == 0:
+                    media_group.append(InputMediaPhoto(f, caption=caption_text))
+                else:
+                    media_group.append(InputMediaPhoto(f))
+            return await bot.send_media_group(
+                chat_id=chat_id,
+                media=media_group,
+                reply_to_message_id=reply_to_message_id,
+            )
+        except TelegramRetryAfter as e:
+            last_exc = e
+            delay: float = float(e.retry_after)
+            logger.warning(
+                f"Flood control (429) en media_group: esperando {delay}s "
+                f"(intento {attempt+1}/{max_retries})"
+            )
+            await asyncio.sleep(delay)
+        except (TelegramTimedOut, TelegramNetworkError) as e:
+            last_exc = e
+            delay: float = WORKER_RETRY_DELAY_BASE * (2 ** attempt)
+            logger.warning(
+                f"Reintento media_group {attempt+1}/{max_retries} en {delay}s: {e}"
+            )
+            await asyncio.sleep(delay)
+        except Exception:
+            raise
+        finally:
+            for f in files:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+    logger.error(f"Se agotaron los reintentos para media_group: {last_exc}")
     raise last_exc
 
 
@@ -891,7 +1030,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         continue
                     path: str = os.path.join(
                         tempfile.gettempdir(),
-                        f"tiktok_slide_{int(time.time())}_{i}.jpg",
+                        f"tiktok_slide_{uuid.uuid4().hex}_{i}.jpg",
                     )
                     for attempt in range(1, 4):
                         try:
@@ -922,30 +1061,18 @@ async def _execute_download(task: DownloadTask) -> None:
                 _inc_stats("failed")
                 return
 
-            await bot.send_chat_action(
-                chat_id=task.chat_id, action=ChatAction.UPLOAD_PHOTO
-            )
+            await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
             caption_text: str = f"\U0001f4e5 Descargado por @{task.bot_username}"
             for batch_start in range(0, len(img_paths), 10):
                 batch: list[str] = img_paths[batch_start : batch_start + 10]
-                media_group: list[InputMediaPhoto] = []
-                files: list = []
-                for i, path in enumerate(batch):
-                    f = open(path, "rb")
-                    files.append(f)
-                    if batch_start == 0 and i == 0:
-                        media_group.append(
-                            InputMediaPhoto(f, caption=caption_text)
-                        )
-                    else:
-                        media_group.append(InputMediaPhoto(f))
-                await bot.send_media_group(
+                await _send_media_group_with_retry(
+                    bot,
                     chat_id=task.chat_id,
-                    media=media_group,
+                    paths=batch,
                     reply_to_message_id=task.message_id,
+                    caption_text=caption_text,
+                    first_batch=(batch_start == 0),
                 )
-                for f in files:
-                    f.close()
 
             for p in img_paths:
                 try:
@@ -1258,6 +1385,7 @@ async def _execute_download(task: DownloadTask) -> None:
 # ============================================================
 application.add_handler(CommandHandler("start", start))
 application.add_handler(CommandHandler("stats", stats))
+application.add_handler(CommandHandler("cancel", cancel))
 application.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, download_video)
 )
@@ -1353,7 +1481,12 @@ def webhook():
         if token_header != WEBHOOK_SECRET:
             logger.warning("Webhook rechazado: secret_token invalido")
             return "Forbidden", 403
-    update: Update = Update.de_json(request.get_json(force=True), application.bot)
+    try:
+        payload: dict = request.get_json(force=True)
+    except Exception as e:
+        logger.warning(f"Webhook con JSON invalido: {e}")
+        return "Bad Request", 400
+    update: Update = Update.de_json(payload, application.bot)
     asyncio.run_coroutine_threadsafe(
         application.process_update(update), _bot_loop
     )
