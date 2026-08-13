@@ -60,7 +60,10 @@ PORT: int = _env_int("PORT", 8080)
 RENDER_EXTERNAL_URL: Optional[str] = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
 ADMIN_IDS: list[int] = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
 
-ALLOWED_DOMAINS: list[str] = ["tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.com", "reddit.com", "redd.it"]
+ALLOWED_DOMAINS: list[str] = [
+    "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.com",
+    "reddit.com", "redd.it", "bilibili.com", "b23.tv", "nicovideo.jp", "nico.ms",
+]
 COOKIES_FILE: str = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR: str = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
 MAX_URLS_PER_MESSAGE: int = _env_int("MAX_URLS_PER_MESSAGE", 20)
@@ -217,7 +220,9 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 TikTok (sin marca de agua)\n"
         "\u2022 Facebook (videos / Reels)\n"
         "\u2022 Twitter / X (videos, GIFs e imagenes)\n"
-        "\u2022 Reddit (videos, imagenes y GIFs)\n\n"
+        "\u2022 Reddit (videos, imagenes y GIFs)\n"
+        "\u2022 Bilibili (anime, clips, AMVs)\n"
+        "\u2022 Niconico (anime, MADs, musica)\n\n"
         "\U0001f4e6 **Cola por usuario:**\n"
         "Puedes enviar varios enlaces seguidos. Se procesaran en orden.\n"
         "Usa /queue para ver tus pendientes y /cancel para vaciar la cola.\n\n"
@@ -413,6 +418,28 @@ def _resolve_tiktok_url(url: str) -> str:
         except Exception as e:
             logger.warning(f"No se pudo resolver URL TikTok corta: {e}")
     return url.split("?")[0]
+
+
+def _resolve_short_url(url: str) -> str:
+    """Resuelve acortadores conocidos (b23.tv, nico.ms) a su URL final.
+
+    Retorna la URL resuelta (sin query params) o la original si falla.
+    """
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").replace("www.", "")
+    if host not in ("b23.tv", "nico.ms"):
+        return url
+    try:
+        head = requests.head(
+            url, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+        )
+        resolved: str = head.url.split("?")[0]
+        logger.info(f"URL corta {host} resuelta: {resolved}")
+        return resolved
+    except Exception as e:
+        logger.warning(f"No se pudo resolver URL corta {host}: {e}")
+        return url
 
 
 def _tiktok_api_fallback(url: str) -> Optional[tuple]:
@@ -944,6 +971,9 @@ async def _queue_worker(user_id: int) -> None:
                 "private": (
                     "\u274c Este contenido es privado y no se puede descargar."
                 ),
+                "premium": (
+                    "\u274c Este contenido requiere cuenta premium en la plataforma."
+                ),
                 "may not be comfortable for some audiences": (
                     "\u274c Este video fue marcado como **sensible** por TikTok.\n"
                     "No es posible descargarlo sin iniciar sesion."
@@ -1157,6 +1187,9 @@ async def _execute_download(task: DownloadTask) -> None:
     url: str = task.url
     bot = application.bot
     is_tiktok: bool = "tiktok.com" in url
+
+    # Resolver acortadores de Bilibili (b23.tv) y Niconico (nico.ms)
+    url = _resolve_short_url(url)
 
     # Limpiar URL de Reddit: eliminar parametros share que interfieren con yt-dlp
     if any(d in url for d in ["reddit.com", "redd.it"]):
