@@ -466,7 +466,14 @@ def _tiktok_api_fallback(url: str) -> Optional[tuple]:
         headers=headers,
         timeout=HTTP_MEDIUM_TIMEOUT,
     )
-    data: dict = resp.json()
+    try:
+        data: dict = resp.json()
+    except ValueError:
+        logger.warning(
+            f"tikwm.com respondio HTTP {resp.status_code} con cuerpo no-JSON: "
+            f"{resp.text[:200]}"
+        )
+        return None
     if data.get("code") != 0:
         logger.warning(f"tikwm.com respondio con codigo {data.get('code')}")
         return None
@@ -504,7 +511,14 @@ def _tiktok_video_api_fallback(url: str) -> Optional[str]:
             headers=headers,
             timeout=HTTP_MEDIUM_TIMEOUT,
         )
-        data: dict = resp.json()
+        try:
+            data: dict = resp.json()
+        except ValueError:
+            logger.warning(
+                f"tikwm.com respondio HTTP {resp.status_code} con cuerpo no-JSON: "
+                f"{resp.text[:200]}"
+            )
+            return None
         if data.get("code") != 0:
             logger.warning(f"tikwm.com respondio con codigo {data.get('code')}: {data.get('msg', '')}")
             return None
@@ -989,11 +1003,6 @@ async def _queue_worker(user_id: int) -> None:
                     "\u274c TikTok cambio algo en su sitio y el bot no puede descargar este video por ahora.\n"
                     "Ya se reporto el problema. Proba de nuevo mas tarde."
                 ),
-                "Unsupported URL": (
-                    "\u274c Ese enlace de Reddit no contiene un video.\n"
-                    "Solo puedo descargar posts de Reddit que tengan videos (v.redd.it) "
-                    "o imagenes/GIFs individuales."
-                ),
             }
             display_msg: str = f"\u274c Error de descarga:\n`{err_msg[:200]}`"
             err_lower: str = err_msg.lower()
@@ -1001,6 +1010,27 @@ async def _queue_worker(user_id: int) -> None:
                 if key.lower() in err_lower:
                     display_msg = msg
                     break
+
+            # "Unsupported URL" depende de la plataforma: el extractor no
+            # reconoce el tipo de enlace (ej. posts /photo/ con yt-dlp viejo).
+            if "unsupported url" in err_lower:
+                if "reddit.com" in url_lower or "redd.it" in url_lower:
+                    display_msg: str = (
+                        "\u274c Ese enlace de Reddit no contiene un video.\n"
+                        "Solo puedo descargar posts de Reddit que tengan videos (v.redd.it) "
+                        "o imagenes/GIFs individuales."
+                    )
+                elif "tiktok.com" in url_lower:
+                    display_msg = (
+                        "\u274c TikTok no reconoce ese enlace como contenido descargable.\n"
+                        "Puede ser un post de fotos que la version actual del bot no soporta. "
+                        "Proba de nuevo mas tarde."
+                    )
+                else:
+                    display_msg = (
+                        "\u274c Ese tipo de enlace no esta soportado por el extractor.\n"
+                        "Verifica que sea un link directo a un video o imagen."
+                    )
 
             if not err_msg.strip() or err_msg.strip() == "(sin mensaje)":
                 if "tiktok.com" in url_lower:
@@ -1197,6 +1227,12 @@ async def _execute_download(task: DownloadTask) -> None:
 
     # Resolver acortadores de Bilibili (b23.tv) y Niconico (nico.ms)
     url = _resolve_short_url(url)
+
+    # Resolver acortadores de TikTok (vt/vm.tiktok.com): yt-dlp debe recibir
+    # la URL canonica (/video/ o /photo/) sin params de tracking (_r/_t), y
+    # los fallbacks ya no necesitan re-resolverla.
+    if is_tiktok:
+        url = _resolve_tiktok_url(url)
 
     # Limpiar URL de Reddit: eliminar parametros share que interfieren con yt-dlp
     if any(d in url for d in ["reddit.com", "redd.it"]):
