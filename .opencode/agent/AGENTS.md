@@ -110,7 +110,8 @@ When writing or refactoring code, you must strictly adhere to these parameters:
 
 ## 💻 Coding Standards (For the AI Agent)
 
-- **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes or `yt-dlp` invocations) using `loop.run_in_executor()` with `_download_executor`.
+- **Async First:** Avoid blocking the event loop. Always wrap synchronous blocking calls (like file system writes, HTTP resolutions or `yt-dlp` invocations) using `loop.run_in_executor()` with `_download_executor`. This includes ALL URL shortener resolvers (`_resolve_short_url`, `_resolve_tiktok_url`, `_resolve_reddit_url`) — they do `requests.head()` internally and MUST never be called directly from async code.
+- **Bounded tracking state:** Per-user dicts (`_user_last_request`, `_chat_action_last_sent`, `_stats["unique_users"]` as `{user_id: first_seen_ts}`) are capped at `_MAX_TRACKED_USERS` (10k); `_trim_by_recency()` keeps the newest half when exceeded. Never add unbounded per-user dicts without wiring the same trim.
 - **Conciseness:** Provide direct code updates. When modifying `main.py`, output the specific changed function or block rather than rewriting the entire file, unless explicitly requested.
 - **Language & Documentation:** Maintain all user-facing bot messages, code comments, and chat explanations in **Spanish**. All code must include clear comments documenting its purpose and logic in Spanish.
 - **Logging Required:** Every function must include logs (`logging.info`, `logging.warning`, `logging.error`) to record its entry, key decisions, and errors. This allows tracking the bot's flow and diagnosing issues without debugging in production.

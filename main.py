@@ -150,13 +150,29 @@ _DOWNLOAD_RESCUE_FORMATS: tuple[str, ...] = (
 # ============================================================
 # Estadisticas globales (thread-safe)
 # ============================================================
+# Cota para los dicts de seguimiento por-usuario: superado el limite se
+# conserva la mitad mas reciente (evita crecimiento sin techo en despliegues
+# longevos; en free tier los restarts ya lo limitan, esto es cinturon y
+# tirantes).
+_MAX_TRACKED_USERS: int = 10_000
+
+
+def _trim_by_recency(d: dict, max_size: int) -> None:
+    """Conserva solo la mitad mas reciente de un dict {id: timestamp}."""
+    if len(d) <= max_size:
+        return
+    keep = sorted(d.items(), key=lambda kv: kv[1], reverse=True)[: max_size // 2]
+    d.clear()
+    d.update(keep)
+
+
 _stats: dict = {
     "start_time": time.time(),
     "total_requests": 0,
     "successful": 0,
     "failed": 0,
-    "unique_users": set(),  # set interno, nunca se serializa como JSON
-    "by_platform": {},      # {"tiktok": {"successful": n, "failed": n}, ...}
+    "unique_users": {},    # user_id -> primera vez visto; nunca serializado
+    "by_platform": {},     # {"tiktok": {"successful": n, "failed": n}, ...}
 }
 _stats_lock: threading.Lock = threading.Lock()
 
@@ -166,9 +182,17 @@ def _inc_stats(key: str) -> None:
         _stats[key] += 1
 
 def _add_unique_user(user_id: int) -> None:
-    """Registra un usuario unico de forma thread-safe."""
+    """Registra un usuario unico de forma thread-safe.
+
+    Si el registro excede la cota, se recorta a la mitad mas reciente: un
+    usuario antiguo podria volver a contar como nuevo, tolerable frente a
+    dejar crecer el dict sin limite.
+    """
     with _stats_lock:
-        _stats["unique_users"].add(user_id)
+        users = _stats["unique_users"]
+        if user_id not in users:
+            _trim_by_recency(users, _MAX_TRACKED_USERS)
+            users[user_id] = time.time()
 
 
 def _platform_of(url: str) -> str:
@@ -203,6 +227,7 @@ def _check_cooldown(user_id: int) -> float:
     """Retorna los segundos restantes de cooldown, o 0 si puede proceder."""
     with _user_cooldown_lock:
         now = time.time()
+        _trim_by_recency(_user_last_request, _MAX_TRACKED_USERS)
         last = _user_last_request.get(user_id, 0)
         remaining = USER_COOLDOWN_SECONDS - (now - last)
         if remaining > 0:
@@ -223,6 +248,7 @@ async def _send_chat_action(bot, chat_id: int, action) -> None:
     """Envia send_chat_action con throttle por chat (max 1 cada ~4.5s)."""
     with _chat_action_lock:
         now = time.time()
+        _trim_by_recency(_chat_action_last_sent, _MAX_TRACKED_USERS)
         last = _chat_action_last_sent.get(chat_id, 0)
         if now - last < CHAT_ACTION_INTERVAL:
             return
@@ -1501,27 +1527,23 @@ async def _execute_download(task: DownloadTask) -> None:
     bot = application.bot
     is_tiktok: bool = "tiktok.com" in url
 
+    # Todas las resoluciones via HTTP corren en el executor: son llamadas
+    # bloqueantes y este event loop es compartido por TODOS los usuarios.
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
     # Resolver acortadores de Bilibili (b23.tv) y Niconico (nico.ms)
-    url = _resolve_short_url(url)
+    url = await loop.run_in_executor(_download_executor, _resolve_short_url, url)
 
     # Resolver acortadores de TikTok (vt/vm.tiktok.com): yt-dlp debe recibir
     # la URL canonica (/video/ o /photo/) sin params de tracking (_r/_t), y
     # los fallbacks ya no necesitan re-resolverla.
     if is_tiktok:
-        url = _resolve_tiktok_url(url)
+        url = await loop.run_in_executor(_download_executor, _resolve_tiktok_url, url)
 
-    # Limpiar URL de Reddit: eliminar parametros share que interfieren con yt-dlp
+    # Limpiar URL de Reddit: _resolve_reddit_url elimina query params y
+    # resuelve los acortadores /s/ a su forma canonica /comments/.
     if any(d in url for d in ["reddit.com", "redd.it"]):
-        url = url.split("?")[0]
-        if "/s/" in url:
-            try:
-                head = requests.head(url, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
-                                     headers={"User-Agent": "Mozilla/5.0"})
-                if head.url and "/comments/" in head.url:
-                    url = head.url.split("?")[0]
-                    logger.info(f"URL de Reddit resuelta: {url}")
-            except Exception:
-                pass
+        url = await loop.run_in_executor(_download_executor, _resolve_reddit_url, url)
 
     # Si no hay mensaje de progreso (multiples URLs), crear uno ahora
     if task.processing_msg_id is None:
@@ -1544,7 +1566,7 @@ async def _execute_download(task: DownloadTask) -> None:
         except Exception:
             pass
 
-    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
 
     # ================================================================
     # Deteccion de TikTok slideshows / posts de una sola imagen
