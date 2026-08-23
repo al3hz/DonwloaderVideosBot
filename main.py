@@ -1486,9 +1486,11 @@ def _find_downloaded_file(video_id: str, *extra_candidates: str) -> Optional[str
 def _ffmpeg_downscale_720(src: str) -> Optional[str]:
     """Re-encode un video a <=720p con ffmpeg (ultimo recurso del rescate 50MB).
 
-    Copia el audio y re-encodea el video con CRF 27 / preset veryfast para
-    mantener el uso de CPU acotado en el free tier. Retorna la ruta nueva o
-    None si ffmpeg no existe o falla.
+    Copia el audio y re-encodea el video con CRF 28 / preset ultrafast: la
+    CPU compartida del free tier es ~4-6x mas lenta que una local y con
+    veryfast el encode superaba los 240s. ultrafast reduce el tiempo ~3x con
+    archivos algo mayores; el techo de 720p mantiene el resultado bajo 50MB.
+    Retorna la ruta nueva o None si ffmpeg no existe o falla.
     """
     ffmpeg: Optional[str] = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -1497,13 +1499,13 @@ def _ffmpeg_downscale_720(src: str) -> Optional[str]:
     cmd = [
         ffmpeg, "-y", "-i", src,
         "-vf", "scale=-2:'min(720,ih)'",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
         "-c:a", "copy",
         "-movflags", "+faststart",
         dst,
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=240)
+        proc = subprocess.run(cmd, capture_output=True, timeout=420)
         if proc.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
             logger.info(f"ffmpeg downscale OK: {dst} ({os.path.getsize(dst)} bytes)")
             return dst
@@ -1687,11 +1689,15 @@ async def _execute_download(task: DownloadTask) -> None:
         opts: dict = get_ydl_opts()
         if format_override:
             opts["format"] = format_override
-            # En rescates, check_formats prunea TODOS los formatos via HEAD al
-            # CDN. Reddit rechaza esas HEADs segundos despues del primer
+            # En rescates, check_formats prunea TODOS los formatos via HEAD
+            # al CDN. Reddit rechaza esas HEADs segundos despues del primer
             # download y cualquier selector muere con "Requested format is
             # not available".
             opts["check_formats"] = False
+            # format_sort dispara el error 'LazyList' object has no attribute
+            # 'sort' al seleccionar sobre info cacheada: para un rescate da
+            # igual el orden fino, basta con que entre algo que quepa.
+            opts.pop("format_sort", None)
         with yt_dlp.YoutubeDL(opts) as ydl:
             if cached_info is not None:
                 # Copia superficial manual: deepcopy del info completo falla
@@ -2007,6 +2013,14 @@ async def _execute_download(task: DownloadTask) -> None:
             # Ultimo recurso: posts cuya unica variante excede 50MB (ej.
             # Reddit con solo 1080p). Re-encode del merge a <=720p con ffmpeg.
             logger.warning("Escalera de formatos agotada; probando re-encode ffmpeg 720p")
+            try:
+                await bot.edit_message_text(
+                    chat_id=task.chat_id,
+                    message_id=task.processing_msg_id,
+                    text="\u23f3 Convirtiendo a calidad reducida (puede tardar ~1-2 min)...",
+                )
+            except Exception:
+                pass
             try:
                 cand_file = await loop.run_in_executor(
                     _download_executor,
