@@ -1,7 +1,8 @@
 # DownloaderVideosBot
 
 Bot de Telegram para descargar videos de varias plataformas y consultar info de anime/manga.
-Sin ffmpeg, sin cookies y sin keys de API.
+Sin cookies y sin keys de API. Si un video supera los 50 MB de Telegram, se reintenta en
+calidad reducida y, como ultimo recurso, se re-encodea a <=720p con ffmpeg.
 
 ## Como usar
 

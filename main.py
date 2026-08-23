@@ -8,6 +8,8 @@ import concurrent.futures
 import traceback
 import html
 import re
+import shutil
+import subprocess
 import uuid
 from dataclasses import dataclass
 from typing import Optional
@@ -451,7 +453,16 @@ def get_ydl_opts() -> dict:
     opts: dict = {
         # best[filesize<50M] primero: formato combinado con audio.
         # Luego bestvideo+bestaudio (merge DASH), luego fallback a cualquier best.
-        "format": "best[filesize<50M]/bestvideo[filesize<50M]+bestaudio/bestvideo+bestaudio/best",
+        # Escalera anti->50MB: si los streams tienen filesize conocido y
+        # exceden 50M (ej. Reddit 1080p), los primeros filtros los saltan
+        # correctamente y caeriamos al merge SIN techo bv*+ba. El escalon
+        # bv*[height<=720] entrega antes una variante que SI cabe.
+        "format": (
+            "best[filesize<50M]"
+            "/bv*[height<=720][filesize<50M]+ba"
+            "/b[height<=720]"
+            "/bv*+ba/best"
+        ),
         # Preferir codecs compatibles con WhatsApp y la mayoria de reproductores:
         # H.264 (vcodec) + AAC (acodec) en contenedor MP4.
         # Si no hay H.264 disponible, cae a lo que haya.
@@ -1410,6 +1421,37 @@ def _find_downloaded_file(video_id: str, *extra_candidates: str) -> Optional[str
     return max(existing)[1]
 
 
+def _ffmpeg_downscale_720(src: str) -> Optional[str]:
+    """Re-encode un video a <=720p con ffmpeg (ultimo recurso del rescate 50MB).
+
+    Copia el audio y re-encodea el video con CRF 27 / preset veryfast para
+    mantener el uso de CPU acotado en el free tier. Retorna la ruta nueva o
+    None si ffmpeg no existe o falla.
+    """
+    ffmpeg: Optional[str] = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+    dst: str = os.path.splitext(src)[0] + "_720.mp4"
+    cmd = [
+        ffmpeg, "-y", "-i", src,
+        "-vf", "scale=-2:'min(720,ih)'",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "27",
+        "-c:a", "copy",
+        "-movflags", "+faststart",
+        dst,
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=240)
+        if proc.returncode == 0 and os.path.isfile(dst) and os.path.getsize(dst) > 0:
+            logger.info(f"ffmpeg downscale OK: {dst} ({os.path.getsize(dst)} bytes)")
+            return dst
+        tail = (proc.stderr or b"")[-200:].decode("utf-8", "ignore")
+        logger.warning(f"ffmpeg downscale rc={proc.returncode}: {tail}")
+    except Exception as e:
+        logger.warning(f"ffmpeg downscale fallo: {e}")
+    return None
+
+
 # ============================================================
 # Ejecucion real de la descarga
 # ============================================================
@@ -1573,20 +1615,39 @@ async def _execute_download(task: DownloadTask) -> None:
     # ================================================================
     logger.info(f"Iniciando descarga yt-dlp para: {url}")
 
-    def download(format_override: Optional[str] = None) -> tuple[str, int, bool, str]:
-        """Funcion bloqueante que corre en el executor para no bloquear el event loop."""
+    def download(
+        format_override: Optional[str] = None,
+        cached_info: Optional[dict] = None,
+    ) -> tuple[str, int, bool, str, dict]:
+        """Funcion bloqueante que corre en el executor para no bloquear el event loop.
+
+        Si se pasa cached_info (dict de una extraccion previa), se salta la
+        re-extraccion y yt-dlp selecciona/descarga contra esos formatos:
+        evita endpoints que throttlean peticiones repetidas (Reddit).
+        """
         logger.debug("download: iniciando yt-dlp")
         opts: dict = get_ydl_opts()
         if format_override:
             opts["format"] = format_override
-            # CRITICO para rescates: check_formats prunea TODOS los formatos
-            # via HEAD al CDN. Reddit rechaza esas HEADs segundos despues del
-            # primer download, el segundo extract_info queda sin formatos y
-            # cualquier selector (incluso 'worst') muere con "Requested
-            # format is not available".
+            # En rescates, check_formats prunea TODOS los formatos via HEAD al
+            # CDN. Reddit rechaza esas HEADs segundos despues del primer
+            # download y cualquier selector muere con "Requested format is
+            # not available".
             opts["check_formats"] = False
         with yt_dlp.YoutubeDL(opts) as ydl:
-            info: dict = ydl.extract_info(url, download=True)
+            if cached_info is not None:
+                # Copia superficial manual: deepcopy del info completo falla
+                # (contiene handles no picklables). Basta con clonar los
+                # campos que process_ie_result muta durante la seleccion.
+                info = dict(cached_info)
+                info["formats"] = [dict(f) for f in cached_info.get("formats") or []]
+                if cached_info.get("requested_downloads"):
+                    info["requested_downloads"] = [
+                        dict(r) for r in cached_info["requested_downloads"]
+                    ]
+                info = ydl.process_ie_result(info, download=True)
+            else:
+                info = ydl.extract_info(url, download=True)
             duration: int = info.get("duration", 0)
             is_video: bool = info.get("is_video", True) or bool(info.get("duration"))
             video_id: str = str(info.get("id", ""))
@@ -1624,7 +1685,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     logger.warning(f"No se pudo renombrar .NA a .mp4: {e}")
 
             logger.info(f"Archivo localizado para {video_id}: {filename}")
-            return filename, duration, is_video, info.get("title") or ""
+            return filename, duration, is_video, info.get("title") or "", info
 
     is_reddit: bool = any(d in url for d in ["reddit.com", "redd.it"])
     is_twitter: bool = any(d in url for d in ["twitter.com", "x.com"])
@@ -1831,7 +1892,7 @@ async def _execute_download(task: DownloadTask) -> None:
     if not downloaded:
         result = await loop.run_in_executor(_download_executor, download)
 
-    filename, duration, is_video, title = result
+    filename, duration, is_video, title, first_info = result
     file_size = os.path.getsize(filename)
     logger.info(f"Descarga completada: {filename} ({file_size} bytes)")
 
@@ -1849,18 +1910,28 @@ async def _execute_download(task: DownloadTask) -> None:
         except Exception:
             pass
 
+        # CRITICO: renombrar (no borrar) el archivo grande a un nombre SIN el
+        # video_id. Si se dejara con su nombre original, _find_downloaded_file
+        # (que barre el cwd por video_id) recuperaria el grande viejo en cada
+        # reintento; y si se borrara, el ultimo recurso ffmpeg quedaria sin
+        # input. El nombre neutral "rescue_input_*" esquiva ambas trampas.
+        oversized_path: Optional[str] = None
+        try:
+            oversized_path = os.path.join(
+                os.path.dirname(filename) or ".",
+                f"rescue_input_{uuid.uuid4().hex}.mp4",
+            )
+            os.rename(filename, oversized_path)
+        except OSError as e:
+            logger.warning(f"No se pudo renombrar el archivo grande: {e}")
+            oversized_path = None
+
         rescued: Optional[tuple] = None
         for fmt in _DOWNLOAD_RESCUE_FORMATS:
-            # CRITICO: borrar el intento anterior ANTES de reintentar.
-            # _find_downloaded_file barre el directorio por video_id y
-            # recuperaria el archivo grande viejo en lugar del nuevo.
-            try:
-                os.remove(filename)
-            except OSError:
-                pass
             try:
                 candidate = await loop.run_in_executor(
-                    _download_executor, lambda f=fmt: download(f)
+                    _download_executor,
+                    lambda f=fmt: download(f, cached_info=first_info),
                 )
                 cand_file: str = candidate[0]
                 size2: int = os.path.getsize(cand_file)
@@ -1870,9 +1941,34 @@ async def _execute_download(task: DownloadTask) -> None:
                     break
                 filename = cand_file
             except Exception as e:
-                logger.warning(f"Rescate con '{fmt[:40]}' fallo: {str(e)[:150]}")
+                logger.warning(
+                    f"Rescate con '{fmt[:40]}' fallo: {str(e)[:150]}"
+                )
+
+        if rescued is None and oversized_path and shutil.which("ffmpeg"):
+            # Ultimo recurso: posts cuya unica variante excede 50MB (ej.
+            # Reddit con solo 1080p). Re-encode del merge a <=720p con ffmpeg.
+            logger.warning("Escalera de formatos agotada; probando re-encode ffmpeg 720p")
+            try:
+                cand_file = await loop.run_in_executor(
+                    _download_executor,
+                    lambda: _ffmpeg_downscale_720(oversized_path),
+                )
+            except Exception as e:
+                cand_file = None
+                logger.warning(f"ffmpeg downscale fallo: {e}")
+            if cand_file and os.path.isfile(cand_file):
+                size3: int = os.path.getsize(cand_file)
+                if size3 <= MAX_FILE_BYTES:
+                    rescued = (cand_file, duration, True, title, first_info)
+                    logger.info(f"Rescate ffmpeg exitoso: {size3} bytes")
 
         if rescued is None:
+            if oversized_path:
+                try:
+                    os.remove(oversized_path)
+                except OSError:
+                    pass
             await bot.edit_message_text(
                 chat_id=task.chat_id,
                 message_id=task.processing_msg_id,
@@ -1882,7 +1978,13 @@ async def _execute_download(task: DownloadTask) -> None:
             _record_result(url, False)
             return
 
-        filename, duration, is_video, title = rescued
+        filename, duration, is_video, title, _ = rescued
+
+        if oversized_path and oversized_path != filename:
+            try:
+                os.remove(oversized_path)
+            except OSError:
+                pass
 
     caption = _build_caption(task, title)
     file_ext: str = os.path.splitext(filename)[1].lower()
@@ -2528,6 +2630,7 @@ def health():
     health_data: dict = {
         "status": "ok" if _bot_ready else "starting",
         "yt_dlp_version": yt_ver,
+        "ffmpeg": bool(shutil.which("ffmpeg")),
         "bot_ready": _bot_ready,
         "queues": {
             "active_queues": len(_user_queues),
