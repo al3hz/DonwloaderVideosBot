@@ -6,6 +6,7 @@ import tempfile
 import logging
 import concurrent.futures
 import traceback
+import html
 import re
 import uuid
 from dataclasses import dataclass
@@ -13,14 +14,22 @@ from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify
-from telegram import Update, InputMediaPhoto, Message, BotCommand
+from telegram import Update, InputMediaPhoto, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import (
+    BadRequest as TelegramBadRequest,
     TimedOut as TelegramTimedOut,
     NetworkError as TelegramNetworkError,
     RetryAfter as TelegramRetryAfter,
 )
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+)
 from telegram.request import HTTPXRequest
 import yt_dlp
 import requests
@@ -69,6 +78,10 @@ ALLOWED_DOMAINS: list[str] = [
 COOKIES_FILE: str = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR: str = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
 MAX_URLS_PER_MESSAGE: int = _env_int("MAX_URLS_PER_MESSAGE", 20)
+# Proxy opcional para las salidas bloqueadas por reputacion de IP (TikTok,
+# tikwm): http:// o socks5://. Si se define, lo usan tikwm, la descarga
+# directa de media y yt-dlp (opts["proxy"]).
+OUTBOUND_PROXY_URL: str = (os.environ.get("OUTBOUND_PROXY_URL") or "").strip()
 
 # ============================================================
 # Constantes de timeout (evita valores dispersos en el codigo)
@@ -218,26 +231,27 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info(f"Comando /start de {user.id} (@{user.username})")
     text = (
         "\U0001f44b \u00a1Hola! Soy tu bot de descargas.\n\n"
-        "\U0001f4e5 **Descarga videos de:**\n"
+        "\U0001f4e5 <b>Descarga videos de:</b>\n"
         "\u2022 TikTok (sin marca de agua)\n"
         "\u2022 Facebook (videos / Reels)\n"
         "\u2022 Twitter / X (videos, GIFs e imagenes)\n"
         "\u2022 Reddit (videos, imagenes y GIFs)\n"
         "\u2022 Bilibili (anime, clips, AMVs)\n"
         "\u2022 Niconico (anime, MADs, musica)\n\n"
-        "\U0001f38c **Funciones de anime:**\n"
-        "\u2022 /anime <nombre> \u2014 info + sinopsis en espanol\n"
-        "\u2022 /manga <nombre> \u2014 info de manga\n"
+        "\U0001f38c <b>Funciones de anime:</b>\n"
+        "\u2022 /anime &lt;nombre&gt; \u2014 info + sinopsis en espanol\n"
+        "\u2022 /manga &lt;nombre&gt; \u2014 info de manga\n"
         "\u2022 /temporada \u2014 animes de la temporada\n"
         "\u2022 /hoy \u2014 emisiones de las proximas 24h\n"
         "\u2022 /waifu \u2014 imagen random\n"
         "\u2022 Enviame un screenshot y lo identifico (anime, episodio y tiempo)\n\n"
-        "\U0001f4e6 **Cola por usuario:**\n"
+        "\U0001f4e6 <b>Cola por usuario:</b>\n"
         "Puedes enviar varios enlaces seguidos. Se procesaran en orden.\n"
         "Usa /queue para ver tus pendientes y /cancel para vaciar la cola.\n\n"
+        "\u2699\ufe0f Usa /config para elegir si ver el credito del bot y el titulo del video.\n\n"
         "\u26a0\ufe0f Limite: 50 MB por archivo."
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -256,13 +270,13 @@ async def stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         uptime_str: str = f"{days}d {hours}h {minutes}m"
 
         text: str = (
-            f"\U0001f4ca **Estadisticas del Bot**\n\n"
-            f"\U0001f550 **Activo:** {uptime_str}\n"
-            f"\U0001f4e5 **Solicitudes totales:** {_stats['total_requests']}\n"
-            f"\u2705 **Exitosas:** {_stats['successful']}\n"
-            f"\u274c **Fallidas:** {_stats['failed']}\n"
-            f"\U0001f465 **Usuarios unicos:** {len(_stats['unique_users'])}\n"
-            f"\U0001f4e6 **Colas activas:** {len(_user_queues)}\n"
+            f"\U0001f4ca <b>Estadisticas del Bot</b>\n\n"
+            f"\U0001f550 <b>Activo:</b> {uptime_str}\n"
+            f"\U0001f4e5 <b>Solicitudes totales:</b> {_stats['total_requests']}\n"
+            f"\u2705 <b>Exitosas:</b> {_stats['successful']}\n"
+            f"\u274c <b>Fallidas:</b> {_stats['failed']}\n"
+            f"\U0001f465 <b>Usuarios unicos:</b> {len(_stats['unique_users'])}\n"
+            f"\U0001f4e6 <b>Colas activas:</b> {len(_user_queues)}\n"
         )
         platform_lines: list[str] = []
         for name in ("tiktok", "twitter", "facebook", "reddit", "otro"):
@@ -272,9 +286,9 @@ async def stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
                     f"\u2022 {name}: {p.get('successful', 0)}\u2705 / {p.get('failed', 0)}\u274c"
                 )
         if platform_lines:
-            text += "\n\U0001f4ca **Por plataforma:**\n" + "\n".join(platform_lines)
+            text += "\n\U0001f4ca <b>Por plataforma:</b>\n" + "\n".join(platform_lines)
 
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="HTML")
 
 
 async def cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -305,9 +319,9 @@ async def cancel(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("\u2139\ufe0f No tienes tareas pendientes en la cola.")
     else:
         await update.message.reply_text(
-            f"\u2705 Canceladas **{drained}** tarea(s) pendientes.\n"
+            f"\u2705 Canceladas <b>{drained}</b> tarea(s) pendientes.\n"
             "Si hay una descarga en curso, se completara igualmente.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
 
 
@@ -321,10 +335,10 @@ async def show_id(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     chat = update.effective_chat
     await update.message.reply_text(
-        f"\U0001f194 **Tus IDs**\n\n"
-        f"\U0001f464 **User ID:** `{user.id}`\n"
-        f"\U0001f4ac **Chat ID:** `{chat.id}`",
-        parse_mode="Markdown",
+        f"\U0001f194 <b>Tus IDs</b>\n\n"
+        f"\U0001f464 <b>User ID:</b> <code>{user.id}</code>\n"
+        f"\U0001f4ac <b>Chat ID:</b> <code>{chat.id}</code>",
+        parse_mode="HTML",
     )
 
 
@@ -347,6 +361,72 @@ async def queue_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         + "\n".join(lines)
     )
     await update.message.reply_text(text, disable_web_page_preview=True)
+
+# ============================================================
+# Configuracion por usuario (captions configurables via /config)
+# ============================================================
+_user_settings: dict[int, dict] = {}
+
+
+def _get_user_settings(user_id: int) -> dict:
+    """Retorna las preferencias del usuario, creandolas con defaults si no existen."""
+    return _user_settings.setdefault(user_id, {"show_credit": True, "show_title": True})
+
+
+def _build_caption(task: DownloadTask, title: str = "") -> str:
+    """Construye el caption de una descarga segun las preferencias del usuario."""
+    s = _get_user_settings(task.user_id)
+    parts: list[str] = []
+    t: str = (title or "").strip()
+    if s.get("show_title", True) and t:
+        parts.append(t if len(t) <= 200 else t[:197] + "...")
+    if s.get("show_credit", True):
+        parts.append(f"\U0001f4e5 Descargado por @{task.bot_username}")
+    return "\n".join(parts)
+
+
+def _build_config_keyboard(s: dict) -> InlineKeyboardMarkup:
+    on: str = "\u2705 ON"
+    off: str = "\u274c OFF"
+    credit: str = on if s.get("show_credit", True) else off
+    title: str = on if s.get("show_title", True) else off
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Credito del bot: {credit}", callback_data="cfg:credit")],
+        [InlineKeyboardButton(f"Titulo/descripcion: {title}", callback_data="cfg:title")],
+    ])
+
+
+async def config_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra y permite editar las preferencias personales del usuario.
+
+    Los ajustes viven en memoria: se reinician con cada deploy/restart.
+    """
+    s = _get_user_settings(update.effective_user.id)
+    await update.message.reply_text(
+        "\u2699\ufe0f <b>Configuracion</b>\n\n"
+        "\u2022 <b>Credito</b>: muestra \"Descargado por @bot\" en cada archivo.\n"
+        "\u2022 <b>Titulo</b>: muestra la descripcion/titulo del video.\n\n"
+        "Toca un boton para activar o desactivar.",
+        parse_mode="HTML",
+        reply_markup=_build_config_keyboard(s),
+    )
+
+
+async def config_cb(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback de los botones de /config: alterna la preferencia y redibuja."""
+    q = update.callback_query
+    if q is None or not q.data:
+        return
+    await q.answer()
+    s = _get_user_settings(q.from_user.id)
+    if q.data == "cfg:credit":
+        s["show_credit"] = not s.get("show_credit", True)
+    elif q.data == "cfg:title":
+        s["show_title"] = not s.get("show_title", True)
+    try:
+        await q.edit_message_reply_markup(reply_markup=_build_config_keyboard(s))
+    except TelegramBadRequest:
+        pass
 
 # ============================================================
 # Opciones de yt-dlp
@@ -401,6 +481,9 @@ def get_ydl_opts() -> dict:
     if os.path.exists(COOKIES_FILE):
         opts["cookiefile"] = COOKIES_FILE
         logger.info(f"Usando cookies desde {COOKIES_FILE}")
+    if OUTBOUND_PROXY_URL:
+        opts["proxy"] = OUTBOUND_PROXY_URL
+        logger.info(f"yt-dlp usando proxy outbound para saltar bloqueos de IP")
     return opts
 
 # ============================================================
@@ -451,33 +534,54 @@ def _resolve_short_url(url: str) -> str:
         return url
 
 
-def _tikwm_post(api_url: str) -> Optional[CurlResponse]:
-    """POST form-urlencoded a tikwm.com impersonando Chrome.
+_TIKWM_PROFILES: tuple[str, ...] = ("chrome", "firefox133", "chrome124")
 
-    tikwm usa Cloudflare y bloquea fingerprints TLS no-navegador (tipico en
-    IPs de datacenter como Render), por eso se usa curl_cffi. Reintenta una
-    vez ante respuestas no-JSON o errores HTTP; retorna la respuesta lista
-    para .json() o None si agota los intentos.
+
+def _tikwm_post(api_url: str) -> Optional[CurlResponse]:
+    """POST form-urlencoded a tikwm.com impersonando navegadores reales.
+
+    tikwm usa Cloudflare: bloquea fingerprints TLS no-navegador y, desde IPs
+    con mala reputacion (datacenters como Render), a veces tambien perfiles
+    concretos. Se rota entre varios perfiles anadiendo cabeceras tipicas de
+    una visita web; si OUTBOUND_PROXY_URL esta definida, sale por ahi.
     """
+    extra_headers: dict = {
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://tikwm.com/",
+        "Origin": "https://tikwm.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+    }
     last_detail: str = "sin respuesta"
-    for attempt in range(1, 3):
+    for attempt, profile in enumerate(_TIKWM_PROFILES, 1):
         try:
             resp: CurlResponse = curl_requests.post(
                 "https://tikwm.com/api/",
                 data={"url": api_url},
                 timeout=HTTP_MEDIUM_TIMEOUT,
-                impersonate="chrome",
+                impersonate=profile,
+                headers=extra_headers,
+                **({"proxy": OUTBOUND_PROXY_URL} if OUTBOUND_PROXY_URL else {}),
             )
             ct: str = resp.headers.get("content-type", "")
             if resp.status_code == 200 and "json" in ct.lower():
                 return resp
-            last_detail = f"HTTP {resp.status_code} ({ct or 'sin content-type'}): {resp.text[:150]}"
+            last_detail = (
+                f"HTTP {resp.status_code} ({ct or 'sin content-type'}) "
+                f"[{profile}]: {resp.text[:150]}"
+            )
         except Exception as e:
-            last_detail = f"{type(e).__name__}: {e}"
-        logger.warning(f"tikwm.com intento {attempt}/2 fallo: {last_detail}")
-        if attempt < 2:
-            time.sleep(2)
-    logger.warning(f"tikwm.com agoto los reintentos: {last_detail}")
+            last_detail = f"{type(e).__name__}: {e} [{profile}]"
+        logger.warning(
+            f"tikwm.com intento {attempt}/{len(_TIKWM_PROFILES)} fallo: {last_detail}"
+        )
+        if attempt < len(_TIKWM_PROFILES):
+            # El free tier de tikwm limita a 1 request/segundo: esperar evita
+            # quemar los siguientes perfiles con un rate-limit artificial.
+            time.sleep(1.1)
+    logger.warning(f"tikwm.com agoto los perfiles de navegador: {last_detail}")
     return None
 
 
@@ -551,7 +655,12 @@ def _tiktok_video_api_fallback(url: str) -> Optional[str]:
             logger.warning(f"tikwm.com no devolvio URL de video. Keys disponibles: {list(result.keys())}")
             return None
 
-        r = curl_requests.get(video_url, timeout=HTTP_DOWNLOAD_TIMEOUT, impersonate="chrome")
+        r = curl_requests.get(
+            video_url,
+            timeout=HTTP_DOWNLOAD_TIMEOUT,
+            impersonate="chrome",
+            **({"proxy": OUTBOUND_PROXY_URL} if OUTBOUND_PROXY_URL else {}),
+        )
         r.raise_for_status()
         filename: str = os.path.join(
             tempfile.gettempdir(),
@@ -862,8 +971,8 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     remaining: float = _check_cooldown(user.id)
     if remaining > 0:
         await update.message.reply_text(
-            f"\u23f3 Espera **{remaining:.0f}s** antes de enviar mas enlaces.",
-            parse_mode="Markdown",
+            f"\u23f3 Espera <b>{remaining:.0f}s</b> antes de enviar mas enlaces.",
+            parse_mode="HTML",
         )
         return
 
@@ -873,9 +982,9 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(candidate_urls) > MAX_URLS_PER_MESSAGE:
         logger.warning(f"Exceso de URLs de {user.id}: {len(candidate_urls)} (max {MAX_URLS_PER_MESSAGE})")
         await update.message.reply_text(
-            f"\u274c Maximo **{MAX_URLS_PER_MESSAGE} enlaces** por mensaje.\n"
+            f"\u274c Maximo <b>{MAX_URLS_PER_MESSAGE} enlaces</b> por mensaje.\n"
             f"Enviaste {len(candidate_urls)}. Dividi en varios mensajes.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         return
 
@@ -917,9 +1026,9 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await _user_queues[user.id].put(task)
     else:
         await update.message.reply_text(
-            f"\u23f3 **{len(valid_urls)} enlaces encolados.**\n"
+            f"\u23f3 <b>{len(valid_urls)} enlaces encolados.</b>\n"
             "Se procesaran uno por uno en orden.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
         for url in valid_urls:
             task = DownloadTask(
@@ -1008,7 +1117,7 @@ async def _queue_worker(user_id: int) -> None:
                     "\u274c Este contenido requiere cuenta premium en la plataforma."
                 ),
                 "may not be comfortable for some audiences": (
-                    "\u274c Este video fue marcado como **sensible** por TikTok.\n"
+                    "\u274c Este video fue marcado como <b>sensible</b> por TikTok.\n"
                     "No es posible descargarlo sin iniciar sesion."
                 ),
                 "Unexpected response from webpage request": (
@@ -1016,7 +1125,9 @@ async def _queue_worker(user_id: int) -> None:
                     "Ya se reporto el problema. Proba de nuevo mas tarde."
                 ),
             }
-            display_msg: str = f"\u274c Error de descarga:\n`{err_msg[:200]}`"
+            display_msg: str = (
+                f"\u274c Error de descarga:\n<code>{html.escape(err_msg[:200])}</code>"
+            )
             err_lower: str = err_msg.lower()
             for key, msg in friendly.items():
                 if key.lower() in err_lower:
@@ -1057,7 +1168,7 @@ async def _queue_worker(user_id: int) -> None:
                     chat_id=task.chat_id,
                     message_id=task.processing_msg_id,
                     text=display_msg,
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                 )
             except Exception:
                 pass
@@ -1068,7 +1179,9 @@ async def _queue_worker(user_id: int) -> None:
             logger.error(f"Error inesperado para {task.url}: {msg}")
             logger.debug(traceback.format_exc())
 
-            display_msg = f"\u274c Error inesperado:\n`{msg}`"
+            display_msg = (
+                f"\u274c Error inesperado:\n<code>{html.escape(msg)}</code>"
+            )
 
             if not str(e).strip():
                 url_lower = task.url.lower()
@@ -1084,7 +1197,7 @@ async def _queue_worker(user_id: int) -> None:
                     chat_id=task.chat_id,
                     message_id=task.processing_msg_id,
                     text=display_msg,
-                    parse_mode="Markdown",
+                    parse_mode="HTML",
                 )
             except Exception:
                 pass
@@ -1125,6 +1238,69 @@ async def _send_file_with_retry(bot, filename: str, send_factory, max_retries: i
             raise
     logger.error(f"Se agotaron los reintentos para enviar {filename}: {last_exc}")
     raise last_exc
+
+
+def _download_url_photo(url: str) -> Optional[str]:
+    """Descarga una imagen por URL a tempfile y retorna la ruta local."""
+    try:
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            },
+            timeout=HTTP_DOWNLOAD_TIMEOUT,
+        )
+        r.raise_for_status()
+        path_ext: str = os.path.splitext(urlparse(url).path)[1].lower()
+        if path_ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
+            path_ext = ".jpg"
+        path: str = os.path.join(
+            tempfile.gettempdir(), f"url_photo_{uuid.uuid4().hex}{path_ext}"
+        )
+        with open(path, "wb") as fh:
+            fh.write(r.content)
+        return path
+    except Exception as e:
+        logger.warning(f"No se pudo descargar la imagen {url}: {e}")
+        return None
+
+
+async def _send_photo_url_safe(bot, chat_id: int, url: str, caption=None, reply_to=None):
+    """sendPhoto por URL con fallback a upload directo.
+
+    El Bot API solo acepta fotos de hasta 5 MB por URL (10 MB por upload);
+    si Telegram rechaza la URL (BadRequest) se descarga localmente y se
+    reenvia como archivo con los reintentos habituales.
+    """
+    try:
+        return await bot.send_photo(
+            chat_id=chat_id, photo=url, caption=caption,
+            reply_to_message_id=reply_to,
+        )
+    except TelegramBadRequest as e:
+        logger.warning(f"send_photo por URL fallo ({e}); probando upload directo")
+
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+    path: Optional[str] = await loop.run_in_executor(
+        _download_executor, _download_url_photo, url
+    )
+    if not path:
+        raise RuntimeError(f"No se pudo descargar la imagen para reenvio: {url}")
+    try:
+        return await _send_file_with_retry(
+            bot, path,
+            lambda f: bot.send_photo(
+                chat_id=chat_id, photo=f, caption=caption,
+                reply_to_message_id=reply_to,
+                read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT,
+                connect_timeout=TG_CONNECT_TIMEOUT,
+            ),
+        )
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
 
 async def _send_media_group_with_retry(
@@ -1354,7 +1530,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 return
 
             await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
-            caption_text: str = f"\U0001f4e5 Descargado por @{task.bot_username}"
+            caption_text: str = _build_caption(task)
             for batch_start in range(0, len(img_paths), 10):
                 batch: list[str] = img_paths[batch_start : batch_start + 10]
                 await _send_media_group_with_retry(
@@ -1491,7 +1667,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     return
 
                 ext: str = os.path.splitext(img_filename)[1].lower()
-                caption: str = f"\U0001f4e5 Descargado por @{task.bot_username}"
+                caption: str = _build_caption(task)
                 if ext == ".gif":
                     await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_VIDEO)
                     await _send_file_with_retry(
@@ -1563,7 +1739,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     _record_result(url, False)
                     return
 
-                caption = f"\U0001f4e5 Descargado por @{task.bot_username}"
+                caption = _build_caption(task)
 
                 # send_video funciona con y sin audio en todos los clientes (mobile incluido).
                 # send_animation con MP4 causa "formato invalido" al guardar en moviles.
@@ -1609,7 +1785,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 if not img_paths:
                     raise
                 await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
-                caption_text = f"\U0001f4e5 Descargado por @{task.bot_username}"
+                caption_text = _build_caption(task)
                 for batch_start in range(0, len(img_paths), 10):
                     batch = img_paths[batch_start:batch_start + 10]
                     await _send_media_group_with_retry(
@@ -1656,12 +1832,7 @@ async def _execute_download(task: DownloadTask) -> None:
         _record_result(url, False)
         return
 
-    title = (title or "").strip()
-    if title:
-        title_short: str = title if len(title) <= 200 else title[:197] + "..."
-        caption = f"\U0001f4e5 {title_short}\nDescargado por @{task.bot_username}"
-    else:
-        caption = f"\U0001f4e5 Descargado por @{task.bot_username}"
+    caption = _build_caption(task, title)
     file_ext: str = os.path.splitext(filename)[1].lower()
 
     # Solo usar send_animation para archivos .gif reales.
@@ -1985,7 +2156,10 @@ async def _reply_media(update: Update, info: dict, kind: str) -> None:
     cover = (info.get("coverImage") or {}).get("large")
     if cover:
         try:
-            await update.message.reply_photo(photo=cover, caption=caption[:1000])
+            await _send_photo_url_safe(
+                update.get_bot(), update.effective_chat.id, cover,
+                caption=caption[:1000],
+            )
         except Exception:
             await update.message.reply_text(caption, disable_web_page_preview=True)
     else:
@@ -2072,7 +2246,10 @@ async def waifu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not url:
         await update.message.reply_text("\u274c No pude conseguir una waifu ahora. Proba de nuevo.")
         return
-    await update.message.reply_photo(photo=url, caption="Aqui tienes tu waifu \U0001f458")
+    await _send_photo_url_safe(
+        context.bot, update.effective_chat.id, url,
+        caption="Aqui tienes tu waifu \U0001f458",
+    )
 
 
 async def identify_anime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2120,11 +2297,12 @@ async def identify_anime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     preview = result.get("image")
     if preview:
         try:
-            await context.bot.send_photo(
-                chat_id=update.effective_chat.id,
-                photo=preview,
+            await _send_photo_url_safe(
+                context.bot,
+                update.effective_chat.id,
+                preview,
                 caption=caption,
-                reply_to_message_id=update.message.message_id,
+                reply_to=update.message.message_id,
             )
             await msg.delete()
             return
@@ -2142,6 +2320,8 @@ application.add_handler(CommandHandler("id", show_id))
 application.add_handler(CommandHandler("queue", queue_cmd))
 application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("cancel", cancel))
+application.add_handler(CommandHandler("config", config_cmd))
+application.add_handler(CallbackQueryHandler(config_cb, pattern=r"^cfg:"))
 application.add_handler(CommandHandler("anime", anime_cmd))
 application.add_handler(CommandHandler("manga", manga_cmd))
 application.add_handler(CommandHandler("temporada", temporada_cmd))
@@ -2170,7 +2350,7 @@ async def _init_bot() -> None:
         await application.bot.set_webhook(
             url=webhook_url,
             secret_token=WEBHOOK_SECRET,
-            allowed_updates=["message"],
+            allowed_updates=["message", "callback_query"],
             max_connections=40,
             drop_pending_updates=True,
         )
@@ -2181,6 +2361,7 @@ async def _init_bot() -> None:
         BotCommand("start", "Mensaje de bienvenida"),
         BotCommand("help", "Ayuda y plataformas soportadas"),
         BotCommand("cancel", "Cancelar descargas pendientes"),
+        BotCommand("config", "Configura credito y titulo de descargas"),
         BotCommand("queue", "Ver tu cola de descargas"),
         BotCommand("id", "Ver tus IDs de chat/usuario"),
         BotCommand("stats", "Estadisticas (solo admins)"),

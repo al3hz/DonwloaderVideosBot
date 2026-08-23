@@ -41,6 +41,7 @@ Tambien puedes enviar un **screenshot** de anime para que el bot lo identifique.
 | `/id` | Muestra tu `user_id` y `chat_id` (util para configurar `ADMIN_IDS`) |
 | `/queue` | Muestra tus descargas pendientes en cola |
 | `/cancel` | Cancela tus descargas pendientes |
+| `/config` | Configura si ver el credito del bot y el titulo del video (por usuario) |
 | `/stats` | Estadisticas del bot, por plataforma (solo admins) |
 | `/anime` | Buscar info de un anime |
 | `/manga` | Buscar info de un manga |
@@ -58,6 +59,7 @@ Tambien puedes enviar un **screenshot** de anime para que el bot lo identifique.
 | `PORT` | No | Puerto del servidor (default: 8080) |
 | `RENDER_EXTERNAL_HOSTNAME` | No | Hostname en Render para configurar el webhook |
 | `COOKIES_FILE` | No | Ruta a archivo de cookies en formato Netscape |
+| `OUTBOUND_PROXY_URL` | No | Proxy HTTP/SOCKS5 para TikTok/tikwm/yt-dlp cuando la IP del host (ej. Render) esta bloqueada por Cloudflare |
 | `YDL_CACHE_DIR` | No | Directorio de cache para yt-dlp |
 | `MAX_URLS_PER_MESSAGE` | No | Maximo de URLs por mensaje (default: 20) |
 
