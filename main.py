@@ -1704,6 +1704,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 # (contiene handles no picklables). Basta con clonar los
                 # campos que process_ie_result muta durante la seleccion.
                 info = dict(cached_info)
+                info.pop("_format_sort_fields", None)
                 info["formats"] = [dict(f) for f in cached_info.get("formats") or []]
                 if cached_info.get("requested_downloads"):
                     info["requested_downloads"] = [
