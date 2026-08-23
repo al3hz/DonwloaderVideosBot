@@ -960,11 +960,14 @@ def _extract_urls(text: str) -> list[str]:
 # Fallback para imagenes de tweets (Twitter/X)
 # ============================================================
 
-def _twitter_images_fallback(url: str) -> Optional[list[str]]:
+def _twitter_media_fallback(url: str) -> Optional[tuple[list[str], list[str]]]:
     """
-    Fallback para tweets que contienen imagenes en lugar de video.
-    Usa la API publica de fxtwitter/vxtwitter para obtener las URLs directas
-    de las imagenes. Retorna la lista de URLs o None si falla.
+    Fallback para tweets que contienen imagenes y/o GIFs en lugar de video.
+    Usa la API publica de fxtwitter/vxtwitter para clasificar el contenido.
+
+    Retorna (urls_de_imagenes, urls_de_gifs) o None si falla. Los GIFs de X
+    son MP4 (tweet_video/*.mp4) y DEBEN enviarse via sendAnimation: mandarlos
+    como foto los convierte en una imagen estatica.
     """
     match = re.search(r"/status/(\d+)", url)
     if not match:
@@ -985,22 +988,42 @@ def _twitter_images_fallback(url: str) -> Optional[list[str]]:
                 logger.warning(f"Twitter fallback: {api} respondio {resp.status_code}")
                 continue
             data: dict = resp.json()
-            urls: list[str] = []
+            imgs: list[str] = []
+            gifs: list[str] = []
             for m in (data.get("media_extended") or []):
-                if isinstance(m, dict) and m.get("type") == "image" and m.get("url"):
-                    urls.append(m["url"])
-            if not urls:
-                urls = [u for u in (data.get("mediaURLs") or []) if isinstance(u, str) and u]
-            if urls:
-                logger.info(f"Twitter fallback: {len(urls)} imagenes via {api}")
-                return urls
+                if not isinstance(m, dict) or not m.get("url"):
+                    continue
+                t: str = str(m.get("type", "")).lower()
+                if t == "gif":
+                    gifs.append(m["url"])
+                elif t == "image":
+                    imgs.append(m["url"])
+            if not imgs and not gifs:
+                # Fallback por extension cuando la API no trae media_extended
+                for u in (data.get("mediaURLs") or []):
+                    if not isinstance(u, str) or not u:
+                        continue
+                    ext: str = os.path.splitext(urlparse(u).path)[1].lower()
+                    if ext == ".mp4" or "/tweet_video/" in u:
+                        gifs.append(u)
+                    else:
+                        imgs.append(u)
+            if imgs or gifs:
+                logger.info(
+                    f"Twitter fallback: {len(imgs)} imagenes / {len(gifs)} gifs via {api}"
+                )
+                return imgs, gifs
         except Exception as e:
             logger.warning(f"Twitter fallback {api} fallo: {e}")
     return None
 
 
-def _download_images(urls: list[str], prefix: str) -> list[str]:
-    """Descarga una lista de imagenes a tempdir. Retorna las rutas locales."""
+def _download_images(urls: list[str], prefix: str, default_ext: str = ".jpg") -> list[str]:
+    """Descarga una lista de imagenes/videos cortos a tempdir.
+
+    default_ext se usa cuando la URL no tiene extension conocida (.jpg para
+    fotos de tweets, .mp4 para GIFs de X).
+    """
     paths: list[str] = []
     headers: dict = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -1010,8 +1033,8 @@ def _download_images(urls: list[str], prefix: str) -> list[str]:
         if not u:
             continue
         ext: str = os.path.splitext(urlparse(u).path)[1].lower()
-        if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif"):
-            ext = ".jpg"
+        if ext not in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"):
+            ext = default_ext
         path: str = os.path.join(tempfile.gettempdir(), f"{prefix}_{uuid.uuid4().hex}_{i}{ext}")
         ok = False
         for attempt in range(1, 4):
@@ -1479,6 +1502,17 @@ def _find_downloaded_file(video_id: str, *extra_candidates: str) -> Optional[str
             continue
 
     if not existing:
+        # Diagnostico: volcar una muestra del directorio para entender por
+        # que el sweep no encontro nada (ej. caso GIF de Twitter donde
+        # yt-dlp descargo pero el archivo no aparecio aqui).
+        try:
+            sample: list[str] = sorted(os.listdir("."))[:20]
+            logger.warning(
+                f"Archivo con id '{video_id}' NO encontrado en {os.getcwd()} "
+                f"({len(sample)}+ entradas): {sample}"
+            )
+        except OSError:
+            pass
         return None
     return max(existing)[1]
 
@@ -1911,46 +1945,84 @@ async def _execute_download(task: DownloadTask) -> None:
 
             raise
 
-    # Para Twitter/X: si no hay video, probar descargar las imagenes del tweet
+    # Para Twitter/X: si no hay video, probar imagenes y GIFs del tweet
     if is_twitter:
         try:
             result = await loop.run_in_executor(_download_executor, download)
             downloaded = True
         except Exception as e:
             err_text: str = str(e)
-            logger.info(f"Twitter: descarga de video fallo, probando imagenes del tweet: {err_text[:200]}")
-            img_urls: Optional[list] = await loop.run_in_executor(
-                _download_executor, _twitter_images_fallback, url
+            logger.info(f"Twitter: descarga de video fallo, probando media del tweet: {err_text[:200]}")
+            media: Optional[tuple] = await loop.run_in_executor(
+                _download_executor, _twitter_media_fallback, url
             )
-            if img_urls:
-                img_paths: list[str] = await loop.run_in_executor(
-                    _download_executor, _download_images, img_urls, "tw_img"
-                )
-                if not img_paths:
-                    raise
-                await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
+            if media:
+                img_urls, gif_urls = media
                 caption_text = _build_caption(task)
-                for batch_start in range(0, len(img_paths), 10):
-                    batch = img_paths[batch_start:batch_start + 10]
-                    await _send_media_group_with_retry(
-                        bot,
-                        chat_id=task.chat_id,
-                        paths=batch,
-                        reply_to_message_id=task.message_id,
-                        caption_text=caption_text,
-                        first_batch=(batch_start == 0),
+                delivered: bool = False
+
+                if img_urls:
+                    img_paths: list[str] = await loop.run_in_executor(
+                        _download_executor, _download_images, img_urls, "tw_img"
                     )
-                for p in img_paths:
+                    if img_paths:
+                        await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_PHOTO)
+                        for batch_start in range(0, len(img_paths), 10):
+                            batch = img_paths[batch_start:batch_start + 10]
+                            await _send_media_group_with_retry(
+                                bot,
+                                chat_id=task.chat_id,
+                                paths=batch,
+                                reply_to_message_id=task.message_id,
+                                caption_text=caption_text,
+                                first_batch=(batch_start == 0),
+                            )
+                        for p in img_paths:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+                        delivered = True
+
+                if gif_urls:
+                    # Los GIFs de X llegan como MP4 (tweet_video/*.mp4) y se
+                    # envian via sendAnimation para que Telegram los reproduzca
+                    # en loop en vez de mostrarlos como foto estatica.
+                    gif_paths: list[str] = await loop.run_in_executor(
+                        _download_executor,
+                        lambda: _download_images(gif_urls, "tw_gif", default_ext=".mp4"),
+                    )
+                    for p in gif_paths:
+                        try:
+                            await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_VIDEO)
+                            await _send_file_with_retry(
+                                bot, p,
+                                lambda f: bot.send_animation(
+                                    chat_id=task.chat_id,
+                                    animation=f,
+                                    caption=caption_text,
+                                    reply_to_message_id=task.message_id,
+                                    read_timeout=TG_READ_TIMEOUT,
+                                    write_timeout=TG_WRITE_TIMEOUT,
+                                    connect_timeout=TG_CONNECT_TIMEOUT,
+                                ),
+                            )
+                            delivered = True
+                        except Exception as gif_err:
+                            logger.warning(f"GIF del tweet no enviado: {gif_err}")
+                        finally:
+                            try:
+                                os.remove(p)
+                            except OSError:
+                                pass
+
+                if delivered:
                     try:
-                        os.remove(p)
-                    except OSError:
+                        await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
+                    except Exception:
                         pass
-                try:
-                    await bot.delete_message(chat_id=task.chat_id, message_id=task.processing_msg_id)
-                except Exception:
-                    pass
-                _record_result(url, True)
-                return
+                    _record_result(url, True)
+                    return
             raise
 
     # Twitter / Facebook (o Reddit/TikTok cuando download() tuvo exito)
