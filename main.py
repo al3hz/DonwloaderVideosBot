@@ -102,9 +102,10 @@ MAX_FILE_BYTES: int = 50 * 1024 * 1024
 # Escalera de rescate: el filtro filesize de yt-dlp falla ABIERTO cuando no
 # conoce el tamano real del stream (DASH/HLS), por eso un merge puede terminar
 # pesando >50MB. Ante eso se reintenta capando resolucion y, si persiste,
-# con el peor formato disponible.
+# con el peor formato disponible. El operador <? hace que la comparacion
+# PASA cuando filesize es desconocido (en vez de excluir el formato).
 _DOWNLOAD_RESCUE_FORMATS: tuple[str, ...] = (
-    "b[vheight<=720][filesize<48M]/bv*[vheight<=720][filesize<42M]+ba/worst",
+    "b[vheight<=720][filesize<?48M]/bv*[vheight<=720][filesize<?42M]+ba/worst",
     "worst",
 )
 
@@ -1578,6 +1579,12 @@ async def _execute_download(task: DownloadTask) -> None:
         opts: dict = get_ydl_opts()
         if format_override:
             opts["format"] = format_override
+            # CRITICO para rescates: check_formats prunea TODOS los formatos
+            # via HEAD al CDN. Reddit rechaza esas HEADs segundos despues del
+            # primer download, el segundo extract_info queda sin formatos y
+            # cualquier selector (incluso 'worst') muere con "Requested
+            # format is not available".
+            opts["check_formats"] = False
         with yt_dlp.YoutubeDL(opts) as ydl:
             info: dict = ydl.extract_info(url, download=True)
             duration: int = info.get("duration", 0)
