@@ -567,12 +567,11 @@ _user_settings: dict[int, dict] = {}
 def _get_user_settings(user_id: int) -> dict:
     """Retorna las preferencias del usuario, creandolas con defaults si no existen."""
     return _user_settings.setdefault(
-        user_id, {"show_credit": True, "show_title": True, "fmt": "mp3", "quality": "192"}
+        user_id, {"show_credit": True, "show_title": True, "fmt": "mp3"}
     )
 
 
 _SPOT_FMTS: tuple[str, ...] = ("mp3", "m4a", "opus", "flac")
-_SPOT_QUALITIES: tuple[str, ...] = ("320", "192", "128")
 
 
 def _build_caption(task: DownloadTask, title: str = "") -> str:
@@ -616,15 +615,10 @@ def _build_config_keyboard(s: dict) -> InlineKeyboardMarkup:
     credit: str = on if s.get("show_credit", True) else off
     title: str = on if s.get("show_title", True) else off
     fmt: str = str(s.get("fmt", "mp3")).upper()
-    q: str = str(s.get("quality", "192"))
-    q_label: str = q + "k" if str(s.get("fmt", "mp3")) != "flac" else "sin perdida"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Credito del bot: {credit}", callback_data="cfg:credit")],
         [InlineKeyboardButton(f"Titulo/descripcion: {title}", callback_data="cfg:title")],
-        [
-            InlineKeyboardButton(f"Formato: {fmt}", callback_data="cfg:fmt"),
-            InlineKeyboardButton(f"Calidad: {q_label}", callback_data="cfg:quality"),
-        ],
+        [InlineKeyboardButton(f"Formato musica: {fmt}", callback_data="cfg:fmt")],
     ])
 
 
@@ -640,8 +634,8 @@ async def config_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2699\ufe0f <b>Configuracion</b>\n\n"
         "\u2022 <b>Credito</b>: muestra \"Descargado por @bot\" en cada archivo.\n"
         "\u2022 <b>Titulo</b>: muestra la descripcion/titulo del video.\n"
-        "\u2022 <b>Formato/Calidad</b>: para la musica de Spotify "
-        "(la calidad aplica a formatos con perdida; YouTube entrega max ~128k reales).\n\n"
+        "\u2022 <b>Formato musica</b>: para los links de Spotify "
+        "(la calidad siempre es la maxima real que entrega la fuente).\n\n"
         "Toca un boton para ciclar.",
         parse_mode="HTML",
         reply_markup=_build_config_keyboard(s),
@@ -662,9 +656,6 @@ async def config_cb(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     elif q.data == "cfg:fmt":
         cur = str(s.get("fmt", "mp3"))
         s["fmt"] = _SPOT_FMTS[(_SPOT_FMTS.index(cur) + 1) % len(_SPOT_FMTS)] if cur in _SPOT_FMTS else _SPOT_FMTS[0]
-    elif q.data == "cfg:quality":
-        cur = str(s.get("quality", "192"))
-        s["quality"] = _SPOT_QUALITIES[(_SPOT_QUALITIES.index(cur) + 1) % len(_SPOT_QUALITIES)] if cur in _SPOT_QUALITIES else _SPOT_QUALITIES[0]
     else:
         return
     _save_user_settings_remote(q.from_user.id, s)
@@ -1299,12 +1290,13 @@ def _spotdl_search_match(query: str, expected_dur: int) -> Optional[str]:
 
 
 def _spotdl_fetch_mp3(query: str, expected_dur: int, out_dir: str,
-                      fmt: str = "mp3", quality: str = "192") -> Optional[str]:
-    """Descarga el audio del mejor match y lo convierte al formato/calidad dados.
+                      fmt: str = "mp3", quality: str = "0") -> Optional[str]:
+    """Descarga el audio del mejor match y lo convierte al formato dado.
 
+    Calidad "0" = VBR maximo en ffmpeg, que se adapta al techo REAL de la
+    fuente (YouTube entrega ~128-160k): fijar 320k solo inflaria el archivo.
     Formatos soportados por FFmpegExtractAudio: mp3/m4a/opus/flac (flac es
-    lossless e ignora la calidad). YouTube entrega max ~128k reales; calidades
-    mayores solo agrandan el archivo.
+    lossless e ignora la calidad).
     """
     video_url = _spotdl_search_match(query, expected_dur)
     if not video_url:
@@ -1355,14 +1347,14 @@ async def _start_spot_listing(url: str, update: Update, context: ContextTypes.DE
         lname, tracks, omitted = await loop.run_in_executor(_download_executor, _job)
     except Exception as e:
         logger.warning(f"Spotify listing fallo: {e}")
-        await wait.edit_text(
+        await wait_msg.edit_text(
             "\u274c No pude leer ese link de Spotify.\n"
             "Verifica que sea un track, album o playlist publica."
         )
         return
 
     if not tracks:
-        await wait.edit_text("\u274c Ese link no contiene pistas descargables.")
+        await wait_msg.edit_text("\u274c Ese link no contiene pistas descargables.")
         return
 
     job_id = uuid.uuid4().hex[:12]
@@ -1395,7 +1387,7 @@ async def _start_spot_listing(url: str, update: Update, context: ContextTypes.DE
             f"\u2b07\ufe0f Todas ({len(tracks)})", callback_data=f"spt:{job_id}:all"
         )])
 
-    await wait.edit_text(
+    await wait_msg.edit_text(
         text,
         parse_mode="HTML",
         disable_web_page_preview=True,
@@ -1482,10 +1474,9 @@ async def _execute_spotdl_task(task: DownloadTask) -> None:
         await _load_remote_settings(task.user_id)
         s = _get_user_settings(task.user_id)
         fmt = str(s.get("fmt", "mp3"))
-        quality = str(s.get("quality", "192"))
         mp3: Optional[str] = await loop.run_in_executor(
             _download_executor,
-            lambda: _spotdl_fetch_mp3(query, dur, out_dir, fmt=fmt, quality=quality),
+            lambda: _spotdl_fetch_mp3(query, dur, out_dir, fmt=fmt),
         )
         if not mp3:
             raise RuntimeError("sin resultados en YouTube Music")
