@@ -64,6 +64,7 @@ Tambien puedes enviar un **screenshot** de anime para que el bot lo identifique.
 | `YDL_CACHE_DIR` | No | Directorio de cache para yt-dlp |
 | `MAX_URLS_PER_MESSAGE` | No | Maximo de URLs por mensaje (default: 20) |
 | `SPOTDL_MAX_TRACKS` | No | Tope de pistas por lista de Spotify (default: 15) |
+| `YOUTUBE_COOKIES_B64` | No | Cookies de YouTube en base64 — **necesarias** para descargar musica desde IPs de datacenter (Render), sino YouTube pide "Sign in to confirm you're not a bot" |
 | `UPSTASH_REDIS_REST_URL` | No | URL REST de Upstash Redis — persiste `/config` de cada usuario y las stats del bot entre reinicios |
 | `UPSTASH_REDIS_REST_TOKEN` | No | Token REST correspondiente |
 
@@ -80,6 +81,24 @@ Para persistirlas gratis (plan Free de Upstash, ~10k comandos/dia, suficiente):
 No requiere dependencias nuevas (usa `requests` contra la API REST) ni conexiones
 persistentes (compatible con spin-downs). Sin las variables, el bot funciona igual
 pero todo vive solo en memoria.
+
+### Cookies de YouTube (requerido para la musica en Render)
+
+YouTube bloquea las descargas desde IPs de datacenter con *"Sign in to confirm
+you're not a bot"*. La solucion es pasarle cookies de un navegador:
+
+1. Abre `youtube.com` en tu navegador (no hace falta iniciar sesion; con sesion
+   iniciada suele ser mas estable, pero usa una cuenta secundaria por prudencia)
+2. Instala la extension **Get cookies.txt LOCALLY** (Chrome/Firefox) y exporta
+   las cookies de `youtube.com` a un archivo `cookies.txt`
+3. Codificalo a base64 y copialo al portapapeles:
+   ```powershell
+   [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
+   ```
+4. En Render: **Environment** → crea `YOUTUBE_COOKIES_B64` y pega el valor → deploy
+
+Las cookies expiran cada tanto (semanas/meses): si vuelve el error, re-exporta y
+actualiza la variable. Nunca subas el `cookies.txt` al repo.
 
 ## APIs externas
 

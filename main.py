@@ -161,6 +161,39 @@ if os.path.isdir(_bin_dir):
 
 def _deno_available() -> bool:
     return bool(shutil.which("deno"))
+
+
+# Cookies de YouTube para saltar el "Sign in to confirm you're not a bot"
+# que YouTube impone a IPs de datacenter (Render). Se pasan en base64 via
+# env var YOUTUBE_COOKIES_B64 (NUNCA commitear el cookies.txt al repo):
+#   PowerShell: [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))
+YT_COOKIES_B64: str = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+_yt_cookies_path: Optional[str] = None
+if YT_COOKIES_B64:
+    try:
+        import base64
+        _yt_cookies_path = os.path.join(tempfile.gettempdir(), "yt_cookies.txt")
+        with open(_yt_cookies_path, "wb") as _cfh:
+            _cfh.write(base64.b64decode(YT_COOKIES_B64))
+        logger.info("Cookies de YouTube decodificadas desde YOUTUBE_COOKIES_B64")
+    except Exception as _ce:
+        logger.warning(f"No se pudo decodificar YOUTUBE_COOKIES_B64: {_ce}")
+        _yt_cookies_path = None
+
+
+def _apply_yt_guard(opts: dict) -> dict:
+    """Inyecta las defensas anti-bot de YouTube en opts de yt-dlp.
+
+    deno (JS runtime) + cookies + proxy outbound, en ese orden. Usarlo en
+    TODA extraccion/descarga que toque youtube.com.
+    """
+    if _yt_cookies_path:
+        opts["cookiefile"] = _yt_cookies_path
+    if _deno_available():
+        opts["js_runtimes"] = {"deno": {}}
+    if OUTBOUND_PROXY_URL:
+        opts["proxy"] = OUTBOUND_PROXY_URL
+    return opts
 COOKIES_FILE: str = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR: str = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
 MAX_URLS_PER_MESSAGE: int = _env_int("MAX_URLS_PER_MESSAGE", 20)
@@ -1275,8 +1308,7 @@ def _spotdl_search_match(query: str, expected_dur: int) -> Optional[str]:
     """
     search_opts: dict = {"quiet": True, "no_warnings": True, "noplaylist": True,
                          "socket_timeout": 30}
-    if _deno_available():
-        search_opts["js_runtimes"] = {"deno": {}}
+    _apply_yt_guard(search_opts)
     with yt_dlp.YoutubeDL(search_opts) as ydl:
         sinfo = ydl.extract_info(f"ytsearch5:{query}", download=False)
     entries = [e for e in (sinfo.get("entries") or []) if e]
@@ -1314,8 +1346,7 @@ def _spotdl_fetch_mp3(query: str, expected_dur: int, out_dir: str,
             "preferredquality": quality,
         }],
     }
-    if _deno_available():
-        opts["js_runtimes"] = {"deno": {}}
+    _apply_yt_guard(opts)
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.extract_info(video_url, download=True)
     outs = sorted(glob_module(os.path.join(out_dir, f"spt_{token}*.{fmt}")),
