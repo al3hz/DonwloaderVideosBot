@@ -24,6 +24,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from telegram.request import HTTPXRequest
 import yt_dlp
 import requests
+from curl_cffi import requests as curl_requests
+from curl_cffi.requests import Response as CurlResponse
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -449,30 +451,50 @@ def _resolve_short_url(url: str) -> str:
         return url
 
 
+def _tikwm_post(api_url: str) -> Optional[CurlResponse]:
+    """POST form-urlencoded a tikwm.com impersonando Chrome.
+
+    tikwm usa Cloudflare y bloquea fingerprints TLS no-navegador (tipico en
+    IPs de datacenter como Render), por eso se usa curl_cffi. Reintenta una
+    vez ante respuestas no-JSON o errores HTTP; retorna la respuesta lista
+    para .json() o None si agota los intentos.
+    """
+    last_detail: str = "sin respuesta"
+    for attempt in range(1, 3):
+        try:
+            resp: CurlResponse = curl_requests.post(
+                "https://tikwm.com/api/",
+                data={"url": api_url},
+                timeout=HTTP_MEDIUM_TIMEOUT,
+                impersonate="chrome",
+            )
+            ct: str = resp.headers.get("content-type", "")
+            if resp.status_code == 200 and "json" in ct.lower():
+                return resp
+            last_detail = f"HTTP {resp.status_code} ({ct or 'sin content-type'}): {resp.text[:150]}"
+        except Exception as e:
+            last_detail = f"{type(e).__name__}: {e}"
+        logger.warning(f"tikwm.com intento {attempt}/2 fallo: {last_detail}")
+        if attempt < 2:
+            time.sleep(2)
+    logger.warning(f"tikwm.com agoto los reintentos: {last_detail}")
+    return None
+
+
 def _tiktok_api_fallback(url: str) -> Optional[tuple]:
     """
     Fallback para TikTok slideshows usando la API de tikwm.com
     cuando yt-dlp no detecta el slideshow correctamente.
     """
     logger.info(f"Usando fallback tikwm.com para {url}")
-    headers: dict = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
     api_url: str = _resolve_tiktok_url(url)
-    resp = requests.post(
-        "https://tikwm.com/api/",
-        data={"url": api_url},
-        headers=headers,
-        timeout=HTTP_MEDIUM_TIMEOUT,
-    )
+    resp = _tikwm_post(api_url)
+    if resp is None:
+        return None
     try:
         data: dict = resp.json()
     except ValueError:
-        logger.warning(
-            f"tikwm.com respondio HTTP {resp.status_code} con cuerpo no-JSON: "
-            f"{resp.text[:200]}"
-        )
+        logger.warning("tikwm.com devolvio JSON invalido pese al content-type")
         return None
     if data.get("code") != 0:
         logger.warning(f"tikwm.com respondio con codigo {data.get('code')}")
@@ -498,26 +520,16 @@ def _tiktok_video_api_fallback(url: str) -> Optional[str]:
     retorna la ruta del archivo, o None si falla.
     """
     logger.info(f"Usando fallback tikwm.com para video TikTok: {url}")
-    headers: dict = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json, text/plain, */*",
-    }
     try:
         api_url: str = _resolve_tiktok_url(url)
 
-        resp = requests.post(
-            "https://tikwm.com/api/",
-            data={"url": api_url},
-            headers=headers,
-            timeout=HTTP_MEDIUM_TIMEOUT,
-        )
+        resp = _tikwm_post(api_url)
+        if resp is None:
+            return None
         try:
             data: dict = resp.json()
         except ValueError:
-            logger.warning(
-                f"tikwm.com respondio HTTP {resp.status_code} con cuerpo no-JSON: "
-                f"{resp.text[:200]}"
-            )
+            logger.warning("tikwm.com devolvio JSON invalido pese al content-type")
             return None
         if data.get("code") != 0:
             logger.warning(f"tikwm.com respondio con codigo {data.get('code')}: {data.get('msg', '')}")
@@ -539,7 +551,7 @@ def _tiktok_video_api_fallback(url: str) -> Optional[str]:
             logger.warning(f"tikwm.com no devolvio URL de video. Keys disponibles: {list(result.keys())}")
             return None
 
-        r = requests.get(video_url, timeout=HTTP_DOWNLOAD_TIMEOUT)
+        r = curl_requests.get(video_url, timeout=HTTP_DOWNLOAD_TIMEOUT, impersonate="chrome")
         r.raise_for_status()
         filename: str = os.path.join(
             tempfile.gettempdir(),

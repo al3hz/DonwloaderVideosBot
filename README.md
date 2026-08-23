@@ -66,12 +66,17 @@ Tambien puedes enviar un **screenshot** de anime para que el bot lo identifique.
 | API | Uso |
 |---|---|
 | yt-dlp | Descargas de todas las plataformas |
-| tikwm.com | Fallback para TikTok (slideshows y videos sensibles) |
+| tikwm.com | Fallback para TikTok: slideshows y posts `/photo/` (yt-dlp no soporta fotos) y videos sensibles |
 | fxtwitter / vxtwitter | Fallback para imagenes de tweets |
 | AniList (GraphQL) | Info de anime/manga, temporada y emisiones |
 | nekos.best | Imagenes de waifu |
 | trace.moe | Identificacion de anime por screenshot |
 | Google Translate | Traduccion de sinopsis al espanol |
+
+> Nota: yt-dlp NO soporta posts `/photo/` de TikTok ni extrae las imagenes de los
+> slideshows (solo su audio, mp3/m4a). Esos casos dependen del fallback tikwm.com,
+> al que se accede con `curl_cffi` impersonando Chrome porque Cloudflare bloquea
+> fingerprints TLS no-navegador tipicos de IPs de datacenter (Render).
 
 ## Stack
 
