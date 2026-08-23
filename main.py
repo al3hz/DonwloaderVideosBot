@@ -98,6 +98,15 @@ TG_READ_TIMEOUT: int = 120
 TG_WRITE_TIMEOUT: int = 120
 TG_CONNECT_TIMEOUT: int = 30
 TG_MEDIA_WRITE_TIMEOUT: int = 300   # uploads grandes (hasta 50MB) necesitan mas margen
+MAX_FILE_BYTES: int = 50 * 1024 * 1024
+# Escalera de rescate: el filtro filesize de yt-dlp falla ABIERTO cuando no
+# conoce el tamano real del stream (DASH/HLS), por eso un merge puede terminar
+# pesando >50MB. Ante eso se reintenta capando resolucion y, si persiste,
+# con el peor formato disponible.
+_DOWNLOAD_RESCUE_FORMATS: tuple[str, ...] = (
+    "b[vheight<=720][filesize<48M]/bv*[vheight<=720][filesize<42M]+ba/worst",
+    "worst",
+)
 
 # ============================================================
 # Estadisticas globales (thread-safe)
@@ -1563,10 +1572,12 @@ async def _execute_download(task: DownloadTask) -> None:
     # ================================================================
     logger.info(f"Iniciando descarga yt-dlp para: {url}")
 
-    def download() -> tuple[str, int, bool, str]:
+    def download(format_override: Optional[str] = None) -> tuple[str, int, bool, str]:
         """Funcion bloqueante que corre en el executor para no bloquear el event loop."""
         logger.debug("download: iniciando yt-dlp")
         opts: dict = get_ydl_opts()
+        if format_override:
+            opts["format"] = format_override
         with yt_dlp.YoutubeDL(opts) as ydl:
             info: dict = ydl.extract_info(url, download=True)
             duration: int = info.get("duration", 0)
@@ -1654,7 +1665,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 )
             if img_filename:
                 file_size: int = os.path.getsize(img_filename)
-                if file_size > 50 * 1024 * 1024:
+                if file_size > MAX_FILE_BYTES:
                     try:
                         os.remove(img_filename)
                     except OSError:
@@ -1727,7 +1738,7 @@ async def _execute_download(task: DownloadTask) -> None:
 
             if tiktok_file:
                 file_size = os.path.getsize(tiktok_file)
-                if file_size > 50 * 1024 * 1024:
+                if file_size > MAX_FILE_BYTES:
                     try:
                         os.remove(tiktok_file)
                     except OSError:
@@ -1817,20 +1828,54 @@ async def _execute_download(task: DownloadTask) -> None:
     file_size = os.path.getsize(filename)
     logger.info(f"Descarga completada: {filename} ({file_size} bytes)")
 
-    if file_size > 50 * 1024 * 1024:
-        logger.warning(f"Archivo excede 50MB: {filename}")
-        try:
-            os.remove(filename)
-        except OSError:
-            pass
-        await bot.edit_message_text(
-            chat_id=task.chat_id,
-            message_id=task.processing_msg_id,
-            text="\u274c El archivo pesa mas de 50 MB.\n"
-                 "Telegram no permite enviar archivos tan grandes a traves de bots normales.",
+    if file_size > MAX_FILE_BYTES:
+        logger.warning(
+            f"Archivo excede {MAX_FILE_BYTES >> 20}MB ({file_size} bytes): "
+            f"iniciando rescate con formatos reducidos"
         )
-        _record_result(url, False)
-        return
+        try:
+            await bot.edit_message_text(
+                chat_id=task.chat_id,
+                message_id=task.processing_msg_id,
+                text="\u23f3 El archivo supera 50 MB. Reintentando en calidad reducida...",
+            )
+        except Exception:
+            pass
+
+        rescued: Optional[tuple] = None
+        for fmt in _DOWNLOAD_RESCUE_FORMATS:
+            # CRITICO: borrar el intento anterior ANTES de reintentar.
+            # _find_downloaded_file barre el directorio por video_id y
+            # recuperaria el archivo grande viejo en lugar del nuevo.
+            try:
+                os.remove(filename)
+            except OSError:
+                pass
+            try:
+                candidate = await loop.run_in_executor(
+                    _download_executor, lambda f=fmt: download(f)
+                )
+                cand_file: str = candidate[0]
+                size2: int = os.path.getsize(cand_file)
+                logger.info(f"Rescate '{fmt[:40]}': {size2} bytes")
+                if size2 <= MAX_FILE_BYTES:
+                    rescued = candidate
+                    break
+                filename = cand_file
+            except Exception as e:
+                logger.warning(f"Rescate con '{fmt[:40]}' fallo: {str(e)[:150]}")
+
+        if rescued is None:
+            await bot.edit_message_text(
+                chat_id=task.chat_id,
+                message_id=task.processing_msg_id,
+                text="\u274c El archivo pesa mas de 50 MB incluso en calidad reducida.\n"
+                     "Telegram no permite enviar archivos tan grandes a traves de bots normales.",
+            )
+            _record_result(url, False)
+            return
+
+        filename, duration, is_video, title = rescued
 
     caption = _build_caption(task, title)
     file_ext: str = os.path.splitext(filename)[1].lower()
