@@ -41,7 +41,43 @@ from curl_cffi.requests import Response as CurlResponse
 from dotenv import load_dotenv
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# ============================================================
+# Logging con redaccion de token
+# ============================================================
+# httpx (usado por python-telegram-bot) loguea cada llamada a la API como URL
+# completa (.../bot<TOKEN>/sendMessage), y Render persiste esas lineas en su
+# dashboard/log drains. El formatter/filtro de abajo sustituyen el token por
+# 'bot<redacted>' en TODOS los mensajes y tracebacks que pasan por root.
+_TOKEN_IN_URL_RE = re.compile(r"bot\d+:[A-Za-z0-9_\-]+")
+
+
+def _scrub_token(text: str) -> str:
+    return _TOKEN_IN_URL_RE.sub("bot<redacted>", text)
+
+
+class _RedactingFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _scrub_token(super().format(record))
+
+
+class _RedactingFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = _scrub_token(record.getMessage())
+            record.args = ()
+        except Exception:
+            pass
+        return True
+
+
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(_RedactingFormatter("%(levelname)s:%(name)s:%(message)s"))
+logging.basicConfig(level=logging.INFO, handlers=[_log_handler], force=True)
+
+# Cintur y tirantes: ademas del handler, filtrar los loggers que mas exponen.
+for _name in ("httpx", "telegram", "telegram.request", "telegram.bot"):
+    logging.getLogger(_name).addFilter(_RedactingFilter())
+
 logger = logging.getLogger(__name__)
 
 # ============================================================
