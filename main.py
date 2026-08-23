@@ -7,6 +7,8 @@ import logging
 import concurrent.futures
 import traceback
 import html
+import json
+import sys
 import re
 import shutil
 import subprocess
@@ -112,7 +114,53 @@ ADMIN_IDS: list[int] = [int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").
 ALLOWED_DOMAINS: list[str] = [
     "tiktok.com", "twitter.com", "x.com", "facebook.com", "fb.com",
     "reddit.com", "redd.it", "bilibili.com", "b23.tv", "nicovideo.jp", "nico.ms",
+    "open.spotify.com", "spotify.com",
 ]
+SPOTDL_MAX_TRACKS: int = _env_int("SPOTDL_MAX_TRACKS", 15)
+
+# ============================================================
+# Persistencia opcional en Upstash Redis (free tier, REST puro)
+# ============================================================
+# Si se definen ambas vars, la configuracion por usuario y las stats del bot
+# sobreviven a reinicios/spin-downs/deployments. Sin ellas, todo queda en
+# memoria como siempre (degradacion graceful).
+_REDIS_URL: str = os.environ.get("UPSTASH_REDIS_REST_URL", "").strip().rstrip("/")
+_REDIS_TOKEN: str = os.environ.get("UPSTASH_REDIS_REST_TOKEN", "").strip()
+_REDIS_ON: bool = bool(_REDIS_URL and _REDIS_TOKEN)
+
+
+def _redis_cmd(*args):
+    """Ejecuta un comando Redis via API REST de Upstash (bloqueante)."""
+    resp = requests.post(
+        _REDIS_URL,
+        headers={"Authorization": f"Bearer {_REDIS_TOKEN}"},
+        json=list(args),
+        timeout=10,
+    )
+    data = resp.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(f"upstash: {data['error']}")
+    return data.get("result")
+
+
+def _redis_bg(*args) -> None:
+    """Comando Redis fire-and-forget en thread daemon (nunca bloquea)."""
+    def _run():
+        try:
+            _redis_cmd(*args)
+        except Exception as e:
+            logger.debug(f"redis bg fallo: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+# deno (runtime JS) es requerido por yt-dlp para extraer streams de YouTube
+# sin 403. El Build Command de Render lo deja en ./bin/deno; en dev debe
+# estar en el PATH manualmente.
+_bin_dir: str = os.path.join(os.getcwd(), "bin")
+if os.path.isdir(_bin_dir):
+    os.environ["PATH"] = _bin_dir + os.pathsep + os.environ.get("PATH", "")
+
+
+def _deno_available() -> bool:
+    return bool(shutil.which("deno"))
 COOKIES_FILE: str = os.environ.get("COOKIES_FILE") or os.path.join(tempfile.gettempdir(), "cookies.txt")
 CACHE_DIR: str = os.environ.get("YDL_CACHE_DIR") or os.path.join(tempfile.gettempdir(), "ydl_cache")
 MAX_URLS_PER_MESSAGE: int = _env_int("MAX_URLS_PER_MESSAGE", 20)
@@ -180,6 +228,8 @@ def _inc_stats(key: str) -> None:
     """Incrementa una estadistica numerica de forma thread-safe."""
     with _stats_lock:
         _stats[key] += 1
+    if key == "total_requests":
+        _mark_dirty("total_requests")
 
 def _add_unique_user(user_id: int) -> None:
     """Registra un usuario unico de forma thread-safe.
@@ -193,6 +243,73 @@ def _add_unique_user(user_id: int) -> None:
         if user_id not in users:
             _trim_by_recency(users, _MAX_TRACKED_USERS)
             users[user_id] = time.time()
+    _mark_dirty("users")
+
+
+# ------------------------------------------------------------
+# Volcado periodico de stats a Redis (si esta configurado)
+# ------------------------------------------------------------
+_stats_dirty_lock: threading.Lock = threading.Lock()
+_stats_dirty: dict[str, int] = {}
+_users_floor: int = 0  # contador persistido; puede superar al set recortado
+
+
+def _mark_dirty(field: str, delta: int = 1) -> None:
+    if not _REDIS_ON:
+        return
+    with _stats_dirty_lock:
+        _stats_dirty[field] = _stats_dirty.get(field, 0) + delta
+
+
+def _restore_and_start_flusher() -> None:
+    """Restaura stats desde Redis y arranca el flusher periodico (thread daemon).
+
+    Llamado desde ensure_bot() una vez listo el bot: NUNCA al importar
+    (gunicorn --preload heredaria el thread roto tras el fork).
+    """
+    global _users_floor
+    if not _REDIS_ON:
+        return
+    try:
+        data = _redis_cmd("HGETALL", "bot_stats") or {}
+        with _stats_lock:
+            for field, val in data.items():
+                try:
+                    v = int(val)
+                except (TypeError, ValueError):
+                    continue
+                if field.startswith("p:"):
+                    parts = field.split(":", 2)
+                    if len(parts) == 3:
+                        slot = _stats["by_platform"].setdefault(
+                            parts[1], {"successful": 0, "failed": 0}
+                        )
+                        key = "successful" if parts[2] == "ok" else "failed"
+                        slot[key] = max(slot.get(key, 0), v)
+                elif field == "users":
+                    _users_floor = max(_users_floor, v)
+                elif field in ("total_requests", "successful", "failed"):
+                    _stats[field] = max(int(_stats.get(field, 0)), v)
+        logger.info(f"Stats restauradas desde Upstash (total={_stats['total_requests']})")
+    except Exception as e:
+        logger.warning(f"Restauracion de stats fallo: {e}")
+
+    def _flush_loop() -> None:
+        while True:
+            time.sleep(30)
+            with _stats_dirty_lock:
+                pending = dict(_stats_dirty)
+                _stats_dirty.clear()
+            if not pending:
+                continue
+            try:
+                for field, delta in pending.items():
+                    _redis_cmd("HINCRBY", "bot_stats", field, delta)
+            except Exception as e:
+                logger.debug(f"flush de stats fallo: {e}")
+
+    threading.Thread(target=_flush_loop, daemon=True).start()
+    logger.info("Flusher de stats hacia Upstash activo")
 
 
 def _platform_of(url: str) -> str:
@@ -216,6 +333,9 @@ def _record_result(url: str, success: bool) -> None:
     with _stats_lock:
         p: dict = _stats["by_platform"].setdefault(platform, {"successful": 0, "failed": 0})
         p["successful" if success else "failed"] += 1
+    if _REDIS_ON:
+        kind = "ok" if success else "fail"
+        _mark_dirty(f"p:{platform}:{kind}")
 
 # ============================================================
 # Rate limiting por usuario
@@ -270,6 +390,7 @@ class DownloadTask:
     message_id: int
     bot_username: str
     processing_msg_id: Optional[int]
+    meta: Optional[dict] = None  # payload extra (ej. track de Spotify)
 
 _user_queues: dict[int, asyncio.Queue] = {}
 _queue_workers: dict[int, asyncio.Task] = {}
@@ -312,6 +433,7 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         "\u2022 Reddit (videos, imagenes y GIFs)\n"
         "\u2022 Bilibili (anime, clips, AMVs)\n"
         "\u2022 Niconico (anime, MADs, musica)\n\n"
+        "\U0001f3b5 <b>Musica:</b> envia un link de Spotify (track, album o playlist) y elige que descargar.\n\n"
         "\U0001f38c <b>Funciones de anime:</b>\n"
         "\u2022 /anime &lt;nombre&gt; \u2014 info + sinopsis en espanol\n"
         "\u2022 /manga &lt;nombre&gt; \u2014 info de manga\n"
@@ -349,7 +471,7 @@ async def stats(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
             f"\U0001f4e5 <b>Solicitudes totales:</b> {_stats['total_requests']}\n"
             f"\u2705 <b>Exitosas:</b> {_stats['successful']}\n"
             f"\u274c <b>Fallidas:</b> {_stats['failed']}\n"
-            f"\U0001f465 <b>Usuarios unicos:</b> {len(_stats['unique_users'])}\n"
+            f"\U0001f465 <b>Usuarios unicos:</b> {max(len(_stats['unique_users']), _users_floor)}\n"
             f"\U0001f4e6 <b>Colas activas:</b> {len(_user_queues)}\n"
         )
         platform_lines: list[str] = []
@@ -444,7 +566,13 @@ _user_settings: dict[int, dict] = {}
 
 def _get_user_settings(user_id: int) -> dict:
     """Retorna las preferencias del usuario, creandolas con defaults si no existen."""
-    return _user_settings.setdefault(user_id, {"show_credit": True, "show_title": True})
+    return _user_settings.setdefault(
+        user_id, {"show_credit": True, "show_title": True, "fmt": "mp3", "quality": "192"}
+    )
+
+
+_SPOT_FMTS: tuple[str, ...] = ("mp3", "m4a", "opus", "flac")
+_SPOT_QUALITIES: tuple[str, ...] = ("320", "192", "128")
 
 
 def _build_caption(task: DownloadTask, title: str = "") -> str:
@@ -459,28 +587,62 @@ def _build_caption(task: DownloadTask, title: str = "") -> str:
     return "\n".join(parts)
 
 
+async def _load_remote_settings(user_id: int) -> None:
+    """Carga desde Redis las preferencias del usuario si no estan en memoria."""
+    if not _REDIS_ON or user_id in _user_settings:
+        return
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+    def _load():
+        raw = _redis_cmd("GET", f"spotcfg:{user_id}")
+        if isinstance(raw, str):
+            _user_settings[user_id] = {**_get_user_settings(user_id), **json.loads(raw)}
+
+    try:
+        await loop.run_in_executor(_download_executor, _load)
+    except Exception as e:
+        logger.debug(f"carga remota de settings fallo: {e}")
+
+
+def _save_user_settings_remote(user_id: int, s: dict) -> None:
+    """Persiste las preferencias en Redis (fire-and-forget) si esta activo."""
+    if _REDIS_ON:
+        _redis_bg("SET", f"spotcfg:{user_id}", json.dumps(s))
+
+
 def _build_config_keyboard(s: dict) -> InlineKeyboardMarkup:
     on: str = "\u2705 ON"
     off: str = "\u274c OFF"
     credit: str = on if s.get("show_credit", True) else off
     title: str = on if s.get("show_title", True) else off
+    fmt: str = str(s.get("fmt", "mp3")).upper()
+    q: str = str(s.get("quality", "192"))
+    q_label: str = q + "k" if str(s.get("fmt", "mp3")) != "flac" else "sin perdida"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"Credito del bot: {credit}", callback_data="cfg:credit")],
         [InlineKeyboardButton(f"Titulo/descripcion: {title}", callback_data="cfg:title")],
+        [
+            InlineKeyboardButton(f"Formato: {fmt}", callback_data="cfg:fmt"),
+            InlineKeyboardButton(f"Calidad: {q_label}", callback_data="cfg:quality"),
+        ],
     ])
 
 
 async def config_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
     """Muestra y permite editar las preferencias personales del usuario.
 
-    Los ajustes viven en memoria: se reinician con cada deploy/restart.
+    Con Upstash configurado, los ajustes persisten entre reinicios.
     """
-    s = _get_user_settings(update.effective_user.id)
+    uid = update.effective_user.id
+    await _load_remote_settings(uid)
+    s = _get_user_settings(uid)
     await update.message.reply_text(
         "\u2699\ufe0f <b>Configuracion</b>\n\n"
         "\u2022 <b>Credito</b>: muestra \"Descargado por @bot\" en cada archivo.\n"
-        "\u2022 <b>Titulo</b>: muestra la descripcion/titulo del video.\n\n"
-        "Toca un boton para activar o desactivar.",
+        "\u2022 <b>Titulo</b>: muestra la descripcion/titulo del video.\n"
+        "\u2022 <b>Formato/Calidad</b>: para la musica de Spotify "
+        "(la calidad aplica a formatos con perdida; YouTube entrega max ~128k reales).\n\n"
+        "Toca un boton para ciclar.",
         parse_mode="HTML",
         reply_markup=_build_config_keyboard(s),
     )
@@ -497,6 +659,15 @@ async def config_cb(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         s["show_credit"] = not s.get("show_credit", True)
     elif q.data == "cfg:title":
         s["show_title"] = not s.get("show_title", True)
+    elif q.data == "cfg:fmt":
+        cur = str(s.get("fmt", "mp3"))
+        s["fmt"] = _SPOT_FMTS[(_SPOT_FMTS.index(cur) + 1) % len(_SPOT_FMTS)] if cur in _SPOT_FMTS else _SPOT_FMTS[0]
+    elif q.data == "cfg:quality":
+        cur = str(s.get("quality", "192"))
+        s["quality"] = _SPOT_QUALITIES[(_SPOT_QUALITIES.index(cur) + 1) % len(_SPOT_QUALITIES)] if cur in _SPOT_QUALITIES else _SPOT_QUALITIES[0]
+    else:
+        return
+    _save_user_settings_remote(q.from_user.id, s)
     try:
         await q.edit_message_reply_markup(reply_markup=_build_config_keyboard(s))
     except TelegramBadRequest:
@@ -1056,6 +1227,327 @@ def _download_images(urls: list[str], prefix: str, default_ext: str = ".jpg") ->
 
 
 # ============================================================
+# Musica via spotdl (metadata) + yt-dlp/ffmpeg (audio)
+# ============================================================
+# spotdl SOLO provee los metadatos de Spotify (`spotdl save`, usa credenciales
+# default incluidas). La descarga la hace nuestro propio pipeline yt-dlp +
+# ffmpeg: el proveedor interno de spotdl es fragil ante el anti-bot actual de
+# YouTube, mientras que yt-dlp reciente + deno en PATH funciona.
+
+_spotdl_jobs: dict[str, dict] = {}  # job_id -> {owner, ts, name, tracks}
+
+
+def _spotdl_save(url: str, out_dir: str) -> list[dict]:
+    """Corre `spotdl save` y retorna la lista cruda de tracks del JSON."""
+    save_file: str = os.path.join(out_dir, "list.spotdl")
+    cmd = [sys.executable, "-m", "spotdl", "save", url, "--save-file", save_file]
+    proc = subprocess.run(cmd, capture_output=True, timeout=120)
+    if proc.returncode != 0 or not os.path.isfile(save_file):
+        tail = (proc.stderr or b"")[-200:].decode("utf-8", "ignore")
+        raise RuntimeError(f"spotdl save fallo: {tail or 'sin salida'}")
+    with open(save_file, encoding="utf-8") as fh:
+        data = json.load(fh)
+    tracks = data.get("tracks") if isinstance(data, dict) else data
+    return tracks or []
+
+
+def _spotify_parse_tracks(raw: list[dict], max_tracks: int) -> tuple[str, list[dict], int]:
+    """Convierte tracks crudos de spotdl a (nombre_lista, tracks, omitidas)."""
+    list_name: str = ""
+    out: list[dict] = []
+    for t in raw:
+        name = t.get("name") or "?"
+        artists_raw = t.get("artists") or ([t["artist"]] if t.get("artist") else [])
+        artists_s = ", ".join(
+            a if isinstance(a, str) else (a.get("name") or "?") for a in artists_raw
+        )
+        entry = {
+            "name": name,
+            "artists": artists_s or "Desconocido",
+            "dur": int(t.get("duration") or 0),
+            "query": f"{artists_s} - {name}",
+            "cover": t.get("cover_url") or "",
+        }
+        if len(out) < max_tracks:
+            out.append(entry)
+        if not list_name and t.get("list_name"):
+            list_name = str(t["list_name"])
+    omitted = max(0, len(raw) - max_tracks)
+    return list_name, out, omitted
+
+
+def _spotdl_search_match(query: str, expected_dur: int) -> Optional[str]:
+    """Busca en YouTube Music y retorna la URL del mejor match por duracion.
+
+    Score = diferencia absoluta de duracion; tolerancia 20s antes de caer al
+    primer resultado.
+    """
+    search_opts: dict = {"quiet": True, "no_warnings": True, "noplaylist": True,
+                         "socket_timeout": 30}
+    if _deno_available():
+        search_opts["js_runtimes"] = {"deno": {}}
+    with yt_dlp.YoutubeDL(search_opts) as ydl:
+        sinfo = ydl.extract_info(f"ytsearch5:{query}", download=False)
+    entries = [e for e in (sinfo.get("entries") or []) if e]
+    if not entries:
+        return None
+    best = min(entries, key=lambda e: abs(int(e.get("duration") or 0) - expected_dur))
+    if expected_dur and abs(int(best.get("duration") or 0) - expected_dur) > 20:
+        best = entries[0]
+    vid = best.get("id")
+    return f"https://www.youtube.com/watch?v={vid}" if vid else None
+
+
+def _spotdl_fetch_mp3(query: str, expected_dur: int, out_dir: str,
+                      fmt: str = "mp3", quality: str = "192") -> Optional[str]:
+    """Descarga el audio del mejor match y lo convierte al formato/calidad dados.
+
+    Formatos soportados por FFmpegExtractAudio: mp3/m4a/opus/flac (flac es
+    lossless e ignora la calidad). YouTube entrega max ~128k reales; calidades
+    mayores solo agrandan el archivo.
+    """
+    video_url = _spotdl_search_match(query, expected_dur)
+    if not video_url:
+        logger.warning(f"spotdl: sin resultados para '{query[:60]}'")
+        return None
+    token = uuid.uuid4().hex[:10]
+    opts: dict = {
+        "format": "bestaudio/best",
+        "outtmpl": os.path.join(out_dir, f"spt_{token}.%(ext)s"),
+        "noplaylist": True, "quiet": True, "no_warnings": True,
+        "socket_timeout": 60,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": fmt,
+            "preferredquality": quality,
+        }],
+    }
+    if _deno_available():
+        opts["js_runtimes"] = {"deno": {}}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        ydl.extract_info(video_url, download=True)
+    outs = sorted(glob_module(os.path.join(out_dir, f"spt_{token}*.{fmt}")),
+                  key=os.path.getsize, reverse=True)
+    return outs[0] if outs else None
+
+
+def glob_module(pattern: str) -> list[str]:
+    """Wrapper de glob.glob para tests/monkeypatching sin import global."""
+    import glob as _glob
+    return _glob.glob(pattern)
+
+
+async def _start_spot_listing(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Muestra la info de un link de Spotify y botones para descargar por pista."""
+    user = update.effective_user
+    wait_msg: Message = await update.message.reply_text("\U0001f50d Obteniendo informacion de Spotify...")
+    loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+
+    def _job() -> tuple[str, list[dict], int]:
+        d = tempfile.mkdtemp(prefix="spj_")
+        try:
+            raw = _spotdl_save(url, d)
+            return _spotify_parse_tracks(raw, SPOTDL_MAX_TRACKS)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    try:
+        lname, tracks, omitted = await loop.run_in_executor(_download_executor, _job)
+    except Exception as e:
+        logger.warning(f"Spotify listing fallo: {e}")
+        await wait.edit_text(
+            "\u274c No pude leer ese link de Spotify.\n"
+            "Verifica que sea un track, album o playlist publica."
+        )
+        return
+
+    if not tracks:
+        await wait.edit_text("\u274c Ese link no contiene pistas descargables.")
+        return
+
+    job_id = uuid.uuid4().hex[:12]
+    _spotdl_jobs[job_id] = {"owner": user.id, "ts": time.time(),
+                            "name": lname or "Spotify", "tracks": tracks}
+    _trim_by_recency(_spotdl_jobs, 20)
+
+    header = (
+        f"\U0001f3b5 <b>{html.escape(lname or 'Spotify')}</b> \u2014 {len(tracks)} pista(s)"
+        + (f" <i>(+{omitted} omitidas, tope {SPOTDL_MAX_TRACKS})</i>" if omitted else "")
+    )
+    lines = [
+        f"{i}. {html.escape(t['artists'])} \u2014 {html.escape(t['name'])} "
+        f"<i>({t['dur'] // 60}:{t['dur'] % 60:02d})</i>"
+        for i, t in enumerate(tracks, 1)
+    ]
+    text = header + "\n\n" + "\n".join(lines) + "\n\n\u2b07\ufe0f Toca un numero para descargarla."
+
+    buttons: list[list[InlineKeyboardButton]] = []
+    row: list[InlineKeyboardButton] = []
+    for i in range(len(tracks)):
+        row.append(InlineKeyboardButton(str(i + 1), callback_data=f"spt:{job_id}:{i}"))
+        if len(row) == 5:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    if len(tracks) > 1:
+        buttons.append([InlineKeyboardButton(
+            f"\u2b07\ufe0f Todas ({len(tracks)})", callback_data=f"spt:{job_id}:all"
+        )])
+
+    await wait.edit_text(
+        text,
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def spot_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Callback de los botones de Spotify: encola la(s) pista(s) elegida(s)."""
+    q = update.callback_query
+    parts = (q.data or "").split(":")
+    await q.answer()
+    if len(parts) != 3:
+        return
+    _, job_id, sel = parts
+    job = _spotdl_jobs.get(job_id)
+    if not job:
+        await q.answer("Lista expirada. Envía el link de nuevo.", show_alert=True)
+        return
+    if q.from_user.id != job["owner"]:
+        await q.answer("Solo quien pidió la lista puede descargar.", show_alert=True)
+        return
+
+    if sel == "all":
+        idxs: list[int] = list(range(len(job["tracks"])))
+    else:
+        try:
+            idxs = [int(sel)]
+        except ValueError:
+            return
+
+    chat_id = q.message.chat.id
+    queue = _user_queues.setdefault(job["owner"], asyncio.Queue())
+    enqueued = 0
+    for i in idxs:
+        if i >= len(job["tracks"]):
+            continue
+        t = job["tracks"][i]
+        task = DownloadTask(
+            url=f"https://open.spotify.com/track/{t['query']}",
+            chat_id=chat_id,
+            user_id=job["owner"],
+            message_id=q.message.message_id,
+            bot_username=context.bot.username,
+            processing_msg_id=None,
+            meta={"kind": "spotdl", **t},
+        )
+        await queue.put(task)
+        enqueued += 1
+
+    worker = _queue_workers.get(job["owner"])
+    if not worker or worker.done():
+        _queue_workers[job["owner"]] = asyncio.create_task(_queue_worker(job["owner"]))
+    await q.answer(f"\U0001f3b5 {enqueued} pista(s) en cola" if enqueued > 1 else "\U0001f3b5 En cola")
+
+
+async def _execute_spotdl_task(task: DownloadTask) -> None:
+    """Descarga una pista de Spotify via match YT Music + MP3, y la envia."""
+    bot = application.bot
+    meta = task.meta or {}
+    query: str = meta.get("query", "")
+    name: str = meta.get("name", "")
+    artists: str = meta.get("artists", "")
+    dur: int = int(meta.get("dur") or 0)
+
+    out_dir = tempfile.mkdtemp(prefix="spt_")
+    thumb_path: Optional[str] = None
+    try:
+        try:
+            await bot.edit_message_text(
+                chat_id=task.chat_id, message_id=task.processing_msg_id,
+                text=f"\U0001f3a5 Buscando: {artists} - {name}",
+            )
+        except Exception:
+            pass
+        if task.processing_msg_id is None:
+            try:
+                msg: Message = await bot.send_message(task.chat_id, "\U0001f3a5 Buscando...")
+                task.processing_msg_id = msg.message_id
+            except Exception:
+                pass
+
+        loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
+        await _load_remote_settings(task.user_id)
+        s = _get_user_settings(task.user_id)
+        fmt = str(s.get("fmt", "mp3"))
+        quality = str(s.get("quality", "192"))
+        mp3: Optional[str] = await loop.run_in_executor(
+            _download_executor,
+            lambda: _spotdl_fetch_mp3(query, dur, out_dir, fmt=fmt, quality=quality),
+        )
+        if not mp3:
+            raise RuntimeError("sin resultados en YouTube Music")
+
+        # Portada como thumbnail (JPEG <=200KB); best-effort
+        cover_url: str = meta.get("cover") or ""
+        if cover_url:
+            try:
+                r = requests.get(cover_url, timeout=15,
+                                 headers={"User-Agent": "Mozilla/5.0"})
+                if r.ok and len(r.content) <= 200 * 1024 and r.content[:3] == b"\xff\xd8\xff":
+                    thumb_path = os.path.join(tempfile.gettempdir(), f"cov_{uuid.uuid4().hex}.jpg")
+                    with open(thumb_path, "wb") as fh:
+                        fh.write(r.content)
+            except Exception:
+                pass
+
+        caption = _build_caption(task, f"{artists} - {name}")
+        thumb_fh = open(thumb_path, "rb") if thumb_path else None
+        try:
+            await _send_chat_action(bot, task.chat_id, ChatAction.UPLOAD_DOCUMENT)
+            await _send_file_with_retry(
+                bot, mp3,
+                lambda f: bot.send_audio(
+                    chat_id=task.chat_id,
+                    audio=f,
+                    caption=caption,
+                    title=name,
+                    performer=artists,
+                    thumbnail=thumb_fh,
+                    reply_to_message_id=task.message_id,
+                    read_timeout=TG_READ_TIMEOUT,
+                    write_timeout=TG_WRITE_TIMEOUT,
+                    connect_timeout=TG_CONNECT_TIMEOUT,
+                ),
+            )
+        finally:
+            if thumb_fh:
+                thumb_fh.close()
+
+        _record_result(task.url, True)
+        logger.info(f"Pista enviada: {artists} - {name}")
+    except Exception as e:
+        logger.warning(f"spotdl tarea fallo ({query[:50]}): {e}")
+        try:
+            await bot.edit_message_text(
+                chat_id=task.chat_id, message_id=task.processing_msg_id,
+                text="\u274c No pude descargar esa cancion. Probá de nuevo.",
+            )
+        except Exception:
+            pass
+        _record_result(task.url, False)
+    finally:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        if thumb_path:
+            try:
+                os.remove(thumb_path)
+            except OSError:
+                pass
+
+
+# ============================================================
 # Handler principal: recibe URLs y las encola
 # ============================================================
 
@@ -1114,6 +1606,11 @@ async def download_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     for _ in valid_urls:
         _inc_stats("total_requests")
     _add_unique_user(user.id)
+
+    # Links de Spotify: flujo interactivo (listado + botones), no cola directa
+    if len(valid_urls) == 1 and "spotify.com" in valid_urls[0].lower():
+        await _start_spot_listing(valid_urls[0], update, context)
+        return
 
     if user.id not in _user_queues:
         _user_queues[user.id] = asyncio.Queue()
@@ -1562,6 +2059,11 @@ async def _execute_download(task: DownloadTask) -> None:
     url: str = task.url
     bot = application.bot
     is_tiktok: bool = "tiktok.com" in url
+
+    # Pistas de Spotify: pipeline propio (match YT Music + MP3), sin yt-dlp video
+    if task.meta and task.meta.get("kind") == "spotdl":
+        await _execute_spotdl_task(task)
+        return
 
     # Todas las resoluciones via HTTP corren en el executor: son llamadas
     # bloqueantes y este event loop es compartido por TODOS los usuarios.
@@ -2621,6 +3123,7 @@ application.add_handler(CommandHandler("stats", stats))
 application.add_handler(CommandHandler("cancel", cancel))
 application.add_handler(CommandHandler("config", config_cmd))
 application.add_handler(CallbackQueryHandler(config_cb, pattern=r"^cfg:"))
+application.add_handler(CallbackQueryHandler(spot_cb, pattern=r"^spt:"))
 application.add_handler(CommandHandler("anime", anime_cmd))
 application.add_handler(CommandHandler("manga", manga_cmd))
 application.add_handler(CommandHandler("temporada", temporada_cmd))
@@ -2705,6 +3208,7 @@ def ensure_bot() -> bool:
             future.result(timeout=60)
             _bot_ready = True
             logger.info("Bot inicializado correctamente")
+            threading.Thread(target=_restore_and_start_flusher, daemon=True).start()
             return True
         except Exception as e:
             logger.error(f"Error inicializando bot: {e}")
@@ -2776,6 +3280,7 @@ def health():
         "status": "ok" if _bot_ready else "starting",
         "yt_dlp_version": yt_ver,
         "ffmpeg": bool(shutil.which("ffmpeg")),
+        "deno": bool(shutil.which("deno")),
         "bot_ready": _bot_ready,
         "queues": {
             "active_queues": len(_user_queues),

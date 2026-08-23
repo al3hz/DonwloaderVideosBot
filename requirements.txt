@@ -1,6 +1,7 @@
 python-telegram-bot>=21.11
 yt-dlp>=2026.7.4
 curl-cffi>=0.15.0
+spotdl>=4.2
 flask>=3.0.0
 gunicorn>=21.2.0
 requests>=2.31.0
