@@ -18,7 +18,16 @@ from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify
-from telegram import Update, InputMediaPhoto, Message, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InputMediaPhoto,
+    Message,
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    ReplyParameters,
+)
 from telegram.constants import ChatAction
 from telegram.error import (
     BadRequest as TelegramBadRequest,
@@ -34,7 +43,6 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.request import HTTPXRequest
 import yt_dlp
 import requests
 from curl_cffi import requests as curl_requests
@@ -131,7 +139,7 @@ _REDIS_ON: bool = bool(_REDIS_URL and _REDIS_TOKEN)
 
 def _redis_cmd(*args):
     """Ejecuta un comando Redis via API REST de Upstash (bloqueante)."""
-    resp = requests.post(
+    resp = _http_session.post(
         _REDIS_URL,
         headers={"Authorization": f"Bearer {_REDIS_TOKEN}"},
         json=list(args),
@@ -227,6 +235,17 @@ _DOWNLOAD_RESCUE_FORMATS: tuple[str, ...] = (
     "b[vheight<=720][filesize<?48M]/bv*[vheight<=720][filesize<?42M]+ba/worst",
     "worst",
 )
+
+# ============================================================
+# Cliente HTTP compartido (requests.Session)
+# ============================================================
+# Se usa un Session para reutilizar conexiones TCP/TLS en llamadas repetidas
+# a los mismos hosts (TikTok, Reddit, Twitter, APIs externas), reduciendo
+# latencia y sobrecarga del free tier.
+_http_session: requests.Session = requests.Session()
+_http_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+})
 
 # ============================================================
 # Estadisticas globales (thread-safe)
@@ -438,16 +457,17 @@ _download_executor: concurrent.futures.ThreadPoolExecutor = concurrent.futures.T
     max_workers=2, thread_name_prefix="download"
 )
 
-_tg_request: HTTPXRequest = HTTPXRequest(
-    connect_timeout=TG_CONNECT_TIMEOUT,
-    read_timeout=TG_READ_TIMEOUT,
-    write_timeout=TG_WRITE_TIMEOUT,
-    media_write_timeout=TG_MEDIA_WRITE_TIMEOUT,
-    pool_timeout=30,
-    connection_pool_size=256,
+application: Application = (
+    Application.builder()
+    .token(TOKEN)
+    .connect_timeout(TG_CONNECT_TIMEOUT)
+    .read_timeout(TG_READ_TIMEOUT)
+    .write_timeout(TG_WRITE_TIMEOUT)
+    .media_write_timeout(TG_MEDIA_WRITE_TIMEOUT)
+    .pool_timeout(30)
+    .connection_pool_size(256)
+    .build()
 )
-
-application: Application = Application.builder().token(TOKEN).request(_tg_request).build()
 
 # ============================================================
 # Handlers de comandos
@@ -589,7 +609,7 @@ async def queue_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         f"\U0001f4e6 **Cola de descargas** ({len(tasks)} pendiente(s)):\n\n"
         + "\n".join(lines)
     )
-    await update.message.reply_text(text, disable_web_page_preview=True)
+    await update.message.reply_text(text, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 # ============================================================
 # Configuracion por usuario (captions configurables via /config)
@@ -778,7 +798,7 @@ def _resolve_tiktok_url(url: str) -> str:
     short_hosts = ("vt.tiktok.com", "vm.tiktok.com")
     if parsed.hostname and parsed.hostname.replace("www.", "") in short_hosts:
         try:
-            head = requests.head(
+            head = _http_session.head(
                 url, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
@@ -800,7 +820,7 @@ def _resolve_short_url(url: str) -> str:
     if host not in ("b23.tv", "nico.ms"):
         return url
     try:
-        head = requests.head(
+        head = _http_session.head(
             url, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
         )
@@ -965,7 +985,7 @@ def _resolve_reddit_url(url: str) -> str:
     clean: str = url.split("?")[0]
     if "/s/" in clean:
         try:
-            head = requests.head(
+            head = _http_session.head(
                 clean, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
@@ -1005,7 +1025,7 @@ def _get_reddit_media_url(post_url: str) -> Optional[str]:
     # Estrategia 2: oembed API
     try:
         oembed_url: str = f"https://www.reddit.com/oembed?url={resolved_url}&format=json"
-        resp = requests.get(
+        resp = _http_session.get(
             oembed_url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             timeout=HTTP_SHORT_TIMEOUT,
@@ -1027,7 +1047,7 @@ def _get_reddit_media_url(post_url: str) -> Optional[str]:
             sub_match = re.search(r"/r/([^/]+)", resolved_url)
             sub: str = sub_match.group(1) if sub_match else ""
             api_url: str = f"https://www.reddit.com/r/{sub}/comments/{post_id}.json"
-            resp = requests.get(
+            resp = _http_session.get(
                 api_url,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
                 timeout=HTTP_SHORT_TIMEOUT,
@@ -1053,7 +1073,7 @@ def _download_reddit_media(media_url: str, post_id: str) -> Optional[str]:
     """
     try:
         try:
-            head = requests.head(
+            head = _http_session.head(
                 media_url, allow_redirects=True, timeout=HTTP_SHORT_TIMEOUT,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
@@ -1063,7 +1083,7 @@ def _download_reddit_media(media_url: str, post_id: str) -> Optional[str]:
 
         ext: str = "jpg"
         try:
-            resp = requests.head(
+            resp = _http_session.head(
                 final_url, timeout=HTTP_SHORT_TIMEOUT,
                 headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             )
@@ -1089,7 +1109,7 @@ def _download_reddit_media(media_url: str, post_id: str) -> Optional[str]:
 
         logger.info(f"Reddit download: descargando {final_url} (ext={ext})")
 
-        r = requests.get(
+        r = _http_session.get(
             final_url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
             timeout=HTTP_LONG_TIMEOUT,
@@ -1178,7 +1198,7 @@ def _twitter_media_fallback(url: str) -> Optional[tuple[list[str], list[str]]]:
         f"https://api.vxtwitter.com/i/status/{tweet_id}",
     ):
         try:
-            resp = requests.get(api, headers=headers, timeout=HTTP_MEDIUM_TIMEOUT)
+            resp = _http_session.get(api, headers=headers, timeout=HTTP_MEDIUM_TIMEOUT)
             if resp.status_code != 200:
                 logger.warning(f"Twitter fallback: {api} respondio {resp.status_code}")
                 continue
@@ -1234,7 +1254,7 @@ def _download_images(urls: list[str], prefix: str, default_ext: str = ".jpg") ->
         ok = False
         for attempt in range(1, 4):
             try:
-                r = requests.get(u, headers=headers, timeout=HTTP_LONG_TIMEOUT)
+                r = _http_session.get(u, headers=headers, timeout=HTTP_LONG_TIMEOUT)
                 r.raise_for_status()
                 with open(path, "wb") as f:
                     f.write(r.content)
@@ -1421,7 +1441,7 @@ async def _start_spot_listing(url: str, update: Update, context: ContextTypes.DE
     await wait_msg.edit_text(
         text,
         parse_mode="HTML",
-        disable_web_page_preview=True,
+        link_preview_options=LinkPreviewOptions(is_disabled=True),
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -1516,7 +1536,7 @@ async def _execute_spotdl_task(task: DownloadTask) -> None:
         cover_url: str = meta.get("cover") or ""
         if cover_url:
             try:
-                r = requests.get(cover_url, timeout=15,
+                r = _http_session.get(cover_url, timeout=15,
                                  headers={"User-Agent": "Mozilla/5.0"})
                 if r.ok and len(r.content) <= 200 * 1024 and r.content[:3] == b"\xff\xd8\xff":
                     thumb_path = os.path.join(tempfile.gettempdir(), f"cov_{uuid.uuid4().hex}.jpg")
@@ -1538,7 +1558,7 @@ async def _execute_spotdl_task(task: DownloadTask) -> None:
                     title=name,
                     performer=artists,
                     thumbnail=thumb_fh,
-                    reply_to_message_id=task.message_id,
+                    reply_parameters=ReplyParameters(message_id=task.message_id),
                     read_timeout=TG_READ_TIMEOUT,
                     write_timeout=TG_WRITE_TIMEOUT,
                     connect_timeout=TG_CONNECT_TIMEOUT,
@@ -1868,7 +1888,7 @@ async def _send_file_with_retry(bot, filename: str, send_factory, max_retries: i
 def _download_url_photo(url: str) -> Optional[str]:
     """Descarga una imagen por URL a tempfile y retorna la ruta local."""
     try:
-        r = requests.get(
+        r = _http_session.get(
             url,
             headers={
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -1897,10 +1917,13 @@ async def _send_photo_url_safe(bot, chat_id: int, url: str, caption=None, reply_
     si Telegram rechaza la URL (BadRequest) se descarga localmente y se
     reenvia como archivo con los reintentos habituales.
     """
+    reply_kwargs = (
+        {"reply_parameters": ReplyParameters(message_id=reply_to)}
+        if reply_to is not None else {}
+    )
     try:
         return await bot.send_photo(
-            chat_id=chat_id, photo=url, caption=caption,
-            reply_to_message_id=reply_to,
+            chat_id=chat_id, photo=url, caption=caption, **reply_kwargs,
         )
     except TelegramBadRequest as e:
         logger.warning(f"send_photo por URL fallo ({e}); probando upload directo")
@@ -1915,8 +1938,7 @@ async def _send_photo_url_safe(bot, chat_id: int, url: str, caption=None, reply_
         return await _send_file_with_retry(
             bot, path,
             lambda f: bot.send_photo(
-                chat_id=chat_id, photo=f, caption=caption,
-                reply_to_message_id=reply_to,
+                chat_id=chat_id, photo=f, caption=caption, **reply_kwargs,
                 read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
             ),
@@ -1932,7 +1954,7 @@ async def _send_media_group_with_retry(
     bot,
     chat_id: int,
     paths: list[str],
-    reply_to_message_id: int,
+    reply_to: int,
     caption_text: str,
     first_batch: bool,
     max_retries: int = 3,
@@ -1958,7 +1980,7 @@ async def _send_media_group_with_retry(
             return await bot.send_media_group(
                 chat_id=chat_id,
                 media=media_group,
-                reply_to_message_id=reply_to_message_id,
+                reply_parameters=ReplyParameters(message_id=reply_to),
             )
         except TelegramRetryAfter as e:
             last_exc = e
@@ -2111,7 +2133,7 @@ async def _execute_download(task: DownloadTask) -> None:
             msg: Message = await bot.send_message(
                 chat_id=task.chat_id,
                 text="\u23f3",
-                reply_to_message_id=task.message_id,
+                reply_to=task.message_id,
             )
             task.processing_msg_id = msg.message_id
         except Exception:
@@ -2125,8 +2147,6 @@ async def _execute_download(task: DownloadTask) -> None:
             )
         except Exception:
             pass
-
-    loop = asyncio.get_running_loop()
 
     # ================================================================
     # Deteccion de TikTok slideshows / posts de una sola imagen
@@ -2172,7 +2192,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     )
                     for attempt in range(1, 4):
                         try:
-                            r = requests.get(
+                            r = _http_session.get(
                                 img_url, headers=dl_headers,
                                 timeout=HTTP_LONG_TIMEOUT,
                             )
@@ -2207,7 +2227,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     bot,
                     chat_id=task.chat_id,
                     paths=batch,
-                    reply_to_message_id=task.message_id,
+                    reply_to=task.message_id,
                     caption_text=caption_text,
                     first_batch=(batch_start == 0),
                 )
@@ -2376,7 +2396,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         bot, img_filename,
                         lambda f: bot.send_animation(
                             chat_id=task.chat_id, animation=f, caption=caption,
-                            reply_to_message_id=task.message_id,
+                            reply_parameters=ReplyParameters(message_id=task.message_id),
                             read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT,
                         ),
                     )
@@ -2397,7 +2417,7 @@ async def _execute_download(task: DownloadTask) -> None:
                         bot, img_filename,
                         lambda f: bot.send_photo(
                             chat_id=task.chat_id, photo=f, caption=caption,
-                            reply_to_message_id=task.message_id,
+                            reply_parameters=ReplyParameters(message_id=task.message_id),
                             read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT,
                         ),
                     )
@@ -2451,7 +2471,7 @@ async def _execute_download(task: DownloadTask) -> None:
                     lambda f: bot.send_video(
                         chat_id=task.chat_id, video=f, caption=caption,
                         supports_streaming=True,
-                        reply_to_message_id=task.message_id,
+                        reply_parameters=ReplyParameters(message_id=task.message_id),
                         read_timeout=TG_READ_TIMEOUT, write_timeout=TG_WRITE_TIMEOUT, connect_timeout=TG_CONNECT_TIMEOUT,
                     ),
                 )
@@ -2497,7 +2517,7 @@ async def _execute_download(task: DownloadTask) -> None:
                                 bot,
                                 chat_id=task.chat_id,
                                 paths=batch,
-                                reply_to_message_id=task.message_id,
+                                reply_to=task.message_id,
                                 caption_text=caption_text,
                                 first_batch=(batch_start == 0),
                             )
@@ -2525,7 +2545,7 @@ async def _execute_download(task: DownloadTask) -> None:
                                     chat_id=task.chat_id,
                                     animation=f,
                                     caption=caption_text,
-                                    reply_to_message_id=task.message_id,
+                                    reply_parameters=ReplyParameters(message_id=task.message_id),
                                     read_timeout=TG_READ_TIMEOUT,
                                     write_timeout=TG_WRITE_TIMEOUT,
                                     connect_timeout=TG_CONNECT_TIMEOUT,
@@ -2669,7 +2689,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 chat_id=task.chat_id,
                 animation=f,
                 caption=caption,
-                reply_to_message_id=task.message_id,
+                reply_parameters=ReplyParameters(message_id=task.message_id),
                 read_timeout=TG_READ_TIMEOUT,
                 write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
@@ -2686,7 +2706,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 caption=caption,
                 duration=duration if duration else None,
                 supports_streaming=True,
-                reply_to_message_id=task.message_id,
+                reply_parameters=ReplyParameters(message_id=task.message_id),
                 read_timeout=TG_READ_TIMEOUT,
                 write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
@@ -2714,7 +2734,7 @@ async def _execute_download(task: DownloadTask) -> None:
                 chat_id=task.chat_id,
                 photo=f,
                 caption=caption,
-                reply_to_message_id=task.message_id,
+                reply_parameters=ReplyParameters(message_id=task.message_id),
                 read_timeout=TG_READ_TIMEOUT,
                 write_timeout=TG_WRITE_TIMEOUT,
                 connect_timeout=TG_CONNECT_TIMEOUT,
@@ -2767,7 +2787,7 @@ def _translate_es(text: str) -> str:
     if not text:
         return ""
     try:
-        r = requests.get(
+        r = _http_session.get(
             "https://translate.googleapis.com/translate_a/single",
             params={"client": "gtx", "sl": "auto", "tl": "es", "dt": "t", "q": text[:4500]},
             timeout=HTTP_MEDIUM_TIMEOUT,
@@ -2782,7 +2802,7 @@ def _translate_es(text: str) -> str:
 
 def _anilist_query(query: str, variables: dict) -> dict:
     """Ejecuta una query GraphQL contra la API de AniList."""
-    resp = requests.post(
+    resp = _http_session.post(
         "https://graphql.anilist.co",
         json={"query": query, "variables": variables},
         headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
@@ -2875,7 +2895,7 @@ def _upcoming_airing(hours: int = 24) -> list[dict]:
 def _random_waifu_url() -> Optional[str]:
     """Obtiene una URL de imagen waifu desde la API de nekos.best."""
     try:
-        r = requests.get(
+        r = _http_session.get(
             "https://nekos.best/api/v2/waifu",
             headers={"User-Agent": "RandomBullshitDownloader/1.0 (personal telegram bot)"},
             timeout=HTTP_MEDIUM_TIMEOUT,
@@ -2908,7 +2928,7 @@ def _trace_moe_search(image_bytes: bytes) -> tuple[Optional[dict], Optional[str]
     for attempt in range(3):
         with _trace_lock:
             try:
-                r = requests.post(
+                r = _http_session.post(
                     url,
                     files={"image": ("frame.jpg", image_bytes, "image/jpeg")},
                     headers=headers,
@@ -2984,9 +3004,9 @@ async def _reply_media(update: Update, info: dict, kind: str) -> None:
                 caption=caption[:1000],
             )
         except Exception:
-            await update.message.reply_text(caption, disable_web_page_preview=True)
+            await update.message.reply_text(caption, link_preview_options=LinkPreviewOptions(is_disabled=True))
     else:
-        await update.message.reply_text(caption, disable_web_page_preview=True)
+        await update.message.reply_text(caption, link_preview_options=LinkPreviewOptions(is_disabled=True))
 
     # Sinopsis completa traducida al espanol (mensaje aparte para no recortarla)
     desc = _clean_html(info.get("description") or "")
@@ -2996,7 +3016,7 @@ async def _reply_media(update: Update, info: dict, kind: str) -> None:
         )
         if len(desc_es) > 4000:
             desc_es = desc_es[:3997] + "..."
-        await update.message.reply_text(f"\U0001f4dd Sinopsis:\n\n{desc_es}", disable_web_page_preview=True)
+        await update.message.reply_text(f"\U0001f4dd Sinopsis:\n\n{desc_es}", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
 
 async def anime_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3155,6 +3175,28 @@ application.add_handler(
     MessageHandler(filters.TEXT & ~filters.COMMAND, download_video)
 )
 application.add_handler(MessageHandler(filters.PHOTO, identify_anime))
+
+
+async def _error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manejo global de errores no capturados (recomendado por python-telegram-bot).
+
+    Loguea el error completo (sin exponer el token) y, si proviene de un
+    update de chat, intenta notificar al usuario. Los errores de descarga ya
+    se manejan dentro de _queue_worker; este handler cubre fallos inesperados
+    en handlers y callbacks.
+    """
+    logger.error("Excepcion no capturada en handler:", exc_info=context.error)
+    if isinstance(update, Update) and update.effective_chat:
+        try:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="\u274c Ocurrio un error inesperado. Intenta de nuevo mas tarde.",
+            )
+        except Exception:
+            pass
+
+
+application.add_error_handler(_error_handler)
 
 # ============================================================
 # Lifecycle del bot (thread-safe)
